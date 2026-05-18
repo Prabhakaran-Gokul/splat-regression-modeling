@@ -233,7 +233,7 @@ def _eval_grid_2d(params, domain_bounds, Ng=80):
 # ---------------------------------------------------------------------------
 
 def demo_uniform_speed_2d(key, k=100, n_int=1000, num_steps=2000, lr=1e-3,
-                           eps=0.02, n_ring=32):
+                           eps=0.08, n_ring=32):
     """
     2D Eikonal |∇u| = 1 (c=1), source at origin.
     Analytical solution: u(x) = ‖x‖.
