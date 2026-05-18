@@ -195,7 +195,7 @@ def init_splat_params(key, k, d, domain_bounds, *, scale=0.3):
     ])
     # Scale V proportional to ‖B‖: splat at radius r should contribute ~r to u=‖x‖
     r_B = jnp.linalg.norm(B, axis=-1, keepdims=True)   # [k, 1]
-    V = jnp.abs(jr.normal(kv, (k, 1))) * 0.1 * r_B
+    V = jnp.abs(jr.normal(kv, (k, 1))) * 0.1 * (r_B + 0.1)
     return V, A, B
 
 
