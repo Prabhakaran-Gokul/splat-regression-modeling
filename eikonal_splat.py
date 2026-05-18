@@ -1003,13 +1003,234 @@ def demo_enhanced_comparison(key, num_steps=2000, lr=1e-3, k=50,
 
 
 # ---------------------------------------------------------------------------
+# Demo: obstacle field with FMM reference
+# ---------------------------------------------------------------------------
+
+def _fmm_reference_2d(x_src_np, eps, speed_np_fn, domain, N=200):
+    """
+    Fast Marching Method on an N×N Cartesian grid.
+
+    speed_np_fn: (n, 2) numpy array → (n,) numpy array of speed values.
+    Returns u[N,N], X[N,N], Y[N,N] with indexing='xy'
+    (u[j,i] is travel time at X[j,i]=x[i], Y[j,i]=y[j]).
+    """
+    import heapq
+    import numpy as np
+
+    x = np.linspace(domain[0][0], domain[0][1], N)
+    y = np.linspace(domain[1][0], domain[1][1], N)
+    dx = x[1] - x[0]
+
+    X, Y = np.meshgrid(x, y, indexing='xy')          # X[j,i]=x[i], Y[j,i]=y[j]
+    pts  = np.stack([X.ravel(), Y.ravel()], axis=1)
+    c    = speed_np_fn(pts).reshape(N, N)
+    s    = 1.0 / c                                     # slowness
+
+    u        = np.full((N, N), np.inf)
+    accepted = np.zeros((N, N), dtype=bool)
+    heap     = []
+
+    # Seed: grid nodes within eps+dx of source
+    r = np.sqrt((X - x_src_np[0]) ** 2 + (Y - x_src_np[1]) ** 2)
+    jj, ii = np.where(r <= eps + dx)
+    for j, i in zip(jj, ii):
+        u[j, i] = float(r[j, i])
+        heapq.heappush(heap, (u[j, i], int(j), int(i)))
+
+    while heap:
+        val, j, i = heapq.heappop(heap)
+        if accepted[j, i]:
+            continue
+        accepted[j, i] = True
+
+        for dj, di in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nj, ni = j + dj, i + di
+            if not (0 <= nj < N and 0 <= ni < N) or accepted[nj, ni]:
+                continue
+
+            ax = min(u[nj, ni - 1] if ni > 0     and accepted[nj, ni - 1] else np.inf,
+                     u[nj, ni + 1] if ni < N - 1 and accepted[nj, ni + 1] else np.inf)
+            ay = min(u[nj - 1, ni] if nj > 0     and accepted[nj - 1, ni] else np.inf,
+                     u[nj + 1, ni] if nj < N - 1 and accepted[nj + 1, ni] else np.inf)
+
+            sdx = s[nj, ni] * dx
+            if ax == np.inf and ay == np.inf:
+                continue
+            elif ax == np.inf:
+                new_val = ay + sdx
+            elif ay == np.inf:
+                new_val = ax + sdx
+            else:
+                a, b = min(ax, ay), max(ax, ay)
+                diff  = b - a
+                if diff >= sdx:
+                    new_val = a + sdx
+                else:
+                    new_val = 0.5 * (a + b + np.sqrt(max(0.0, 2 * sdx ** 2 - diff ** 2)))
+
+            if new_val < u[nj, ni]:
+                u[nj, ni] = new_val
+                heapq.heappush(heap, (float(new_val), int(nj), int(ni)))
+
+    return u, X, Y
+
+
+def demo_obstacle_field(key, k=200, n_int=2000, num_steps=3000, lr=5e-3,
+                        eps=0.08, n_ring=32):
+    """
+    2D Eikonal with two rectangular obstacle bars leaving a central gap.
+    Source at (-0.7, 0).  Obstacles encoded as low-speed regions (c=0.05).
+    FMM provides the reference solution; SRM is compared against it.
+    """
+    import numpy as np
+    from scipy.interpolate import RegularGridInterpolator
+
+    print("=" * 60)
+    print("Demo: 2D Eikonal — obstacle field (FMM reference)")
+    print("      Source: (-0.7, 0)   two bars, gap at |y| < 0.25")
+    print("=" * 60)
+
+    domain   = [(-1.0, 1.0), (-1.0, 1.0)]
+    x_src    = jnp.array([-0.7, 0.0])
+    x_src_np = np.array([-0.7, 0.0])
+
+    # Obstacle geometry: upper and lower bars leave a corridor at |y| <= 0.25
+    OBS = [
+        dict(x=(-0.1, 0.55), y=( 0.25,  0.85)),   # upper bar
+        dict(x=(-0.1, 0.55), y=(-0.85, -0.25)),    # lower bar
+    ]
+    OBS_SPEED = 0.05
+
+    def _in_obs_jax(x):
+        mask = jnp.zeros(x.shape[0], dtype=bool)
+        for o in OBS:
+            mask = mask | (
+                (x[:, 0] >= o['x'][0]) & (x[:, 0] <= o['x'][1]) &
+                (x[:, 1] >= o['y'][0]) & (x[:, 1] <= o['y'][1])
+            )
+        return mask
+
+    def _in_obs_np(x):
+        mask = np.zeros(len(x), dtype=bool)
+        for o in OBS:
+            mask = mask | (
+                (x[:, 0] >= o['x'][0]) & (x[:, 0] <= o['x'][1]) &
+                (x[:, 1] >= o['y'][0]) & (x[:, 1] <= o['y'][1])
+            )
+        return mask
+
+    def speed_fn(x):
+        return jnp.where(_in_obs_jax(x)[:, None], OBS_SPEED, 1.0)
+
+    def speed_np(x):
+        return np.where(_in_obs_np(np.asarray(x, dtype=np.float32)), OBS_SPEED, 1.0)
+
+    # Collocation: free-space only, outside source ring
+    key, sk = jr.split(key)
+    lo    = jnp.array([b[0] for b in domain])
+    hi    = jnp.array([b[1] for b in domain])
+    cands = jr.uniform(sk, (n_int * 10, 2)) * (hi - lo) + lo
+    r_src = jnp.linalg.norm(cands - x_src, axis=-1)
+    free  = ~_in_obs_jax(cands) & (r_src > eps)
+    interior_pts = cands[free][:n_int]
+    print(f"  Collocation: {len(interior_pts)} free-space pts")
+
+    source_pts, source_vals = source_ring_2d(x_src, eps, n_ring, c_at_src=1.0)
+
+    key, sk = jr.split(key)
+    init_params = init_splat_params(sk, k, 2, domain, scale=0.25)
+    params, history = train_eikonal_splat(
+        init_params, interior_pts, source_pts, source_vals, speed_fn,
+        num_steps=num_steps, lr=lr, physics_weight=1.0, log_interval=500,
+    )
+
+    # FMM reference
+    print("  Computing FMM reference (N=200)…")
+    u_fmm, Xf, Yf = _fmm_reference_2d(x_src_np, eps, speed_np, domain, N=200)
+
+    xf = np.linspace(domain[0][0], domain[0][1], 200)
+    yf = np.linspace(domain[1][0], domain[1][1], 200)
+    fmm_interp = RegularGridInterpolator(
+        (yf, xf), u_fmm, method="linear", bounds_error=False, fill_value=np.nan,
+    )
+
+    # Eval grid
+    Ng = 100
+    u_srm, X1, X2 = _eval_grid_2d(params, domain, Ng=Ng)
+    u_srm  = np.array(u_srm)
+    X1_np  = np.array(X1)
+    X2_np  = np.array(X2)
+
+    pts_eval   = np.stack([X2_np.ravel(), X1_np.ravel()], axis=1)   # (y, x) for interp
+    u_ref      = fmm_interp(pts_eval).reshape(Ng, Ng)
+
+    pts_grid   = np.stack([X1_np.ravel(), X2_np.ravel()], axis=1)   # (x, y) for obstacle
+    mask_free  = ~_in_obs_np(pts_grid).reshape(Ng, Ng)
+
+    valid = mask_free & np.isfinite(u_ref) & np.isfinite(u_srm)
+    mse   = float(np.mean((u_srm[valid] - u_ref[valid]) ** 2))
+    print(f"  Grid MSE vs FMM (free-space): {mse:.4e}")
+
+    # Clip u values for display; mask obstacle interiors
+    vmax  = min(float(np.nanpercentile(u_ref[mask_free], 96)), 2.5)
+    levels = np.linspace(float(eps) + 0.05, vmax, 14)
+    extent = [domain[0][0], domain[0][1], domain[1][0], domain[1][1]]
+
+    u_ref_disp = np.where(mask_free, np.clip(u_ref, 0, vmax), np.nan)
+    u_srm_disp = np.where(mask_free, np.clip(u_srm, 0, vmax), np.nan)
+    err_disp   = np.where(valid, np.abs(u_srm - u_ref), np.nan)
+
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4.8))
+
+    # Speed / obstacle map
+    spd_grid = speed_np(pts_grid).reshape(Ng, Ng)
+    im0 = axes[0].imshow(spd_grid, origin="lower", extent=extent,
+                          cmap="RdYlGn", vmin=0.0, vmax=1.05)
+    axes[0].set_title("Speed field $c(x)$\n(dark = obstacle, c=0.05)")
+    axes[0].plot(*x_src_np, "b*", markersize=11, label="source")
+    axes[0].legend(fontsize=9); axes[0].set_xlabel("$x_1$"); axes[0].set_ylabel("$x_2$")
+    plt.colorbar(im0, ax=axes[0], label="c(x)")
+
+    # FMM reference
+    im1 = axes[1].imshow(u_ref_disp, origin="lower", extent=extent,
+                          cmap="viridis", vmin=0, vmax=vmax)
+    axes[1].contour(X1_np, X2_np, u_ref_disp, levels=levels,
+                     colors="white", linewidths=0.7, alpha=0.85)
+    axes[1].set_title("FMM reference\n(ground truth)")
+    axes[1].set_xlabel("$x_1$")
+    plt.colorbar(im1, ax=axes[1], label="travel time")
+
+    # SRM prediction
+    im2 = axes[2].imshow(u_srm_disp, origin="lower", extent=extent,
+                          cmap="viridis", vmin=0, vmax=vmax)
+    axes[2].contour(X1_np, X2_np, u_srm_disp, levels=levels,
+                     colors="white", linewidths=0.7, alpha=0.85)
+    axes[2].set_title(f"SRM prediction (k={k}, {num_steps} steps)\nMSE vs FMM = {mse:.2e}")
+    axes[2].set_xlabel("$x_1$")
+    plt.colorbar(im2, ax=axes[2], label="travel time")
+
+    # Absolute error
+    im3 = axes[3].imshow(err_disp, origin="lower", extent=extent,
+                          cmap="hot", vmin=0)
+    axes[3].set_title("|SRM − FMM|")
+    axes[3].set_xlabel("$x_1$")
+    plt.colorbar(im3, ax=axes[3], label="abs error")
+
+    plt.tight_layout()
+    plt.savefig("eikonal_obstacle_field.png", dpi=150, bbox_inches="tight")
+    print("  Saved eikonal_obstacle_field.png")
+    return params, history
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Eikonal SRM solver demo")
     parser.add_argument(
-        "--demo", choices=["uniform", "variable", "both", "compare", "mlp", "enhanced"],
+        "--demo",
+        choices=["uniform", "variable", "both", "compare", "mlp", "enhanced", "obstacle"],
         default="both", help="which demo to run",
     )
     parser.add_argument("--mlp-hidden", type=int, nargs="+", default=[32, 32],
@@ -1048,5 +1269,9 @@ if __name__ == "__main__":
         key, sk = jr.split(key)
         demo_enhanced_comparison(sk, num_steps=args.steps, lr=args.lr, k=args.k,
                                   mlp_hidden=tuple(args.mlp_hidden))
+
+    if args.demo == "obstacle":
+        key, sk = jr.split(key)
+        demo_obstacle_field(sk, k=args.k, num_steps=args.steps, lr=args.lr)
 
     plt.show()
