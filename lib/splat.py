@@ -1,3 +1,5 @@
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -8,10 +10,10 @@ from jax.scipy.linalg import solve
 from tqdm import trange 
 import optax
 from flax import linen as nn
-from jaxkan.KAN import KAN
+from jaxkan.models.KAN import KAN
 from tqdm import tqdm
 
-@jax.jit
+@partial(jax.jit, static_argnames=('rho',))
 def eval_splat(X, splatnn, rho=None, eps=1e-6):
     '''
     X: [n,d] real tensor
@@ -89,7 +91,7 @@ def eval_splat(X, splatnn, rho=None, eps=1e-6):
 
     return Y
 
-@jax.jit
+@partial(jax.jit, static_argnums=(3,))
 def eval_splat_grad(splatnn, X, Y, variation, rho=None, eps=1e-9, sgd=False):
     '''
     
@@ -394,10 +396,9 @@ def gd_splat_regression(init_splat, train_X, train_Y, lr=1e-4, num_steps=1000, t
                         '''
         # for debugging: vDdFx.block_until_ready() will un-lazy load it 
         variation = lambda x, y: 2*(eval_splat(x, cur_splat) - y) / len(y)
+        variation = jax.jit(variation)
        
         grad_V, grad_A, grad_B = eval_splat_grad(cur_splat, train_X, train_Y, variation)
-        
-        
 
         if adam:
             grads = (
@@ -416,7 +417,6 @@ def gd_splat_regression(init_splat, train_X, train_Y, lr=1e-4, num_steps=1000, t
             key = jax.random.key(0)
             noise = jnp.einsum('ijk,ik->ij', A_, jax.random.normal(key, B_.shape) * selective_noise[1] * (V_ < selective_noise[0]))
             B_ = B_ + jnp.sqrt(lr) * noise
-
 
         splats.append((V_, A_, B_))
         cur_splat = (V_, A_, B_)
@@ -444,12 +444,12 @@ if __name__ == "__main__":
     
     # Generate training data
     key = jr.PRNGKey(42)
-    n_train = 20
+    n_train = 100
     train_X_1d = jr.uniform(key, (n_train, 1), minval=-1, maxval=1)
     train_Y_1d = target_1d(train_X_1d) + 0.1 * jr.normal(jr.split(key)[0], (n_train, 1))
     
     # Initialize splat parameters
-    k = 5  # number of splats
+    k = 200  # number of splats
     key_init = jr.PRNGKey(123)
     keys = jr.split(key_init, 3)
     
@@ -492,12 +492,12 @@ if __name__ == "__main__":
     
     # Generate training data
     key_2d = jr.PRNGKey(456)
-    n_train_2d = 50
+    n_train_2d = 300
     train_X_2d = jr.uniform(key_2d, (n_train_2d, 2), minval=-1, maxval=1)
     train_Y_2d = target_2d(train_X_2d) + 0.05 * jr.normal(jr.split(key_2d)[0], (n_train_2d, 1))
     
     # Initialize 2D splat parameters
-    k_2d = 8  # number of splats
+    k_2d = 300  # number of splats
     key_init_2d = jr.PRNGKey(789)
     keys_2d = jr.split(key_init_2d, 3)
     
@@ -513,7 +513,7 @@ if __name__ == "__main__":
     print("Training 2D splat model...")
     splat_history_2d = gd_splat_regression(
         init_splat_2d, train_X_2d, train_Y_2d,
-        lr=5e-3, num_steps=1000, verbose=True
+        lr=5e-3, num_steps=200, verbose=True
     )
     
     # Create 2D animation

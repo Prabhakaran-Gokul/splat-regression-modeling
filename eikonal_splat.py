@@ -43,10 +43,27 @@ from lib.splat import eval_splat
 
 
 # ---------------------------------------------------------------------------
+# Mother functions
+# ---------------------------------------------------------------------------
+
+def gaussian_rho(x):
+    """Standard multivariate Gaussian (default). Decays to zero away from center."""
+    return jnp.exp(-0.5 * jnp.sum(x ** 2, axis=-1)) / (2 * jnp.pi)
+
+
+def distance_rho(x):
+    """Euclidean distance RBF. Grows linearly away from center.
+    Exact single-splat representation of the uniform-speed Eikonal solution:
+    with k=1, B=source, A=αI, V=α³ → f(x) = ‖x−B‖ exactly."""
+    return jnp.sqrt(jnp.sum(x ** 2, axis=-1) + 1e-12)
+
+
+# ---------------------------------------------------------------------------
 # Core solver
 # ---------------------------------------------------------------------------
 
-def eikonal_loss(params, interior_pts, source_pts, source_vals, speed_fn, physics_weight):
+def eikonal_loss(params, interior_pts, source_pts, source_vals, speed_fn,
+                 physics_weight, rho=None):
     """
     Physics-informed loss for the Eikonal equation.
 
@@ -66,12 +83,13 @@ def eikonal_loss(params, interior_pts, source_pts, source_vals, speed_fn, physic
         source_vals:  [n_src]     target u values at source_pts
         speed_fn:     c(x): [n, d] → [n, 1], JAX-traceable
         physics_weight: scalar weight on PDE term
+        rho:          mother function (None = Gaussian)
     """
     def u_single(x):
-        return eval_splat(x[None, :], params)[0, 0]
+        return eval_splat(x[None, :], params, rho=rho)[0, 0]
 
     # Boundary condition
-    u_bc = eval_splat(source_pts, params).squeeze(-1)         # [n_src]
+    u_bc = eval_splat(source_pts, params, rho=rho).squeeze(-1)   # [n_src]
     bc_loss = jnp.mean((u_bc - source_vals) ** 2)
 
     # PDE residual at interior collocation points
@@ -95,6 +113,7 @@ def train_eikonal_splat(
     lr=1e-3,
     physics_weight=1.0,
     log_interval=500,
+    rho=None,
 ):
     """
     Train a splat model to solve the Eikonal equation.
@@ -122,14 +141,17 @@ def train_eikonal_splat(
     optimizer = optax.adam(schedule)
     opt_state = optimizer.init(init_params)
 
-    # speed_fn and physics_weight captured from closure; step is JIT-compiled
-    # once per call.  int_pts/src_pts/src_vals are dynamic arguments so they
-    # can be swapped (e.g. for mini-batches) without recompilation.
+    # speed_fn, physics_weight, and rho captured from closure; step is
+    # JIT-compiled once per call.  int_pts/src_pts/src_vals are dynamic.
+    def _loss(params, int_pts, src_pts, src_vals):
+        return eikonal_loss(params, int_pts, src_pts, src_vals,
+                            speed_fn, physics_weight, rho)
+
     @jax.jit
     def step(params, opt_state, int_pts, src_pts, src_vals):
         (total, aux), grads = jax.value_and_grad(
-            eikonal_loss, has_aux=True
-        )(params, int_pts, src_pts, src_vals, speed_fn, physics_weight)
+            _loss, has_aux=True
+        )(params, int_pts, src_pts, src_vals)
         updates, new_state = optimizer.update(grads, opt_state, params)
         return optax.apply_updates(params, updates), new_state, total, aux
 
@@ -219,12 +241,12 @@ def _uniform_collocation_2d(key, n, domain_bounds, exclude_center, min_dist):
     return cands[dist > min_dist][:n]
 
 
-def _eval_grid_2d(params, domain_bounds, Ng=80):
+def _eval_grid_2d(params, domain_bounds, Ng=80, rho=None):
     g1 = jnp.linspace(*domain_bounds[0], Ng)
     g2 = jnp.linspace(*domain_bounds[1], Ng)
     X1, X2 = jnp.meshgrid(g1, g2)
     pts = jnp.stack([X1.ravel(), X2.ravel()], axis=1)
-    u = eval_splat(pts, params).reshape(Ng, Ng)
+    u = eval_splat(pts, params, rho=rho).reshape(Ng, Ng)
     return u, X1, X2
 
 
@@ -233,7 +255,7 @@ def _eval_grid_2d(params, domain_bounds, Ng=80):
 # ---------------------------------------------------------------------------
 
 def demo_uniform_speed_2d(key, k=100, n_int=1000, num_steps=2000, lr=1e-3,
-                           eps=0.08, n_ring=32):
+                           eps=0.08, n_ring=32, rho=None):
     """
     2D Eikonal |∇u| = 1 (c=1), source at origin.
     Analytical solution: u(x) = ‖x‖.
@@ -266,9 +288,10 @@ def demo_uniform_speed_2d(key, k=100, n_int=1000, num_steps=2000, lr=1e-3,
     params, history = train_eikonal_splat(
         init_params, interior_pts, source_pts, source_vals, speed_fn,
         num_steps=num_steps, lr=lr, physics_weight=1.0, log_interval=500,
+        rho=rho,
     )
 
-    u_pred, X1, X2 = _eval_grid_2d(params, domain)
+    u_pred, X1, X2 = _eval_grid_2d(params, domain, rho=rho)
     u_true = jnp.sqrt(X1 ** 2 + X2 ** 2)
     mse = float(jnp.mean((u_pred - u_true) ** 2))
     print(f"  Grid MSE vs analytical u=‖x‖: {mse:.4e}")
@@ -391,14 +414,117 @@ def demo_variable_speed_2d(key, k=100, n_int=1000, num_steps=2000, lr=1e-3,
 
 
 # ---------------------------------------------------------------------------
+# RHO comparison demo
+# ---------------------------------------------------------------------------
+
+def demo_rho_comparison(key, num_steps=2000, lr=1e-3, eps=0.08, n_ring=32,
+                         n_int=1000):
+    """
+    Side-by-side comparison of Gaussian vs distance-RBF mother functions on
+    the uniform-speed Eikonal (analytical solution u=‖x‖).
+
+    Runs three configurations:
+      (A) Gaussian,     k=50
+      (B) Distance RBF, k=50
+      (C) Distance RBF, k=1   — theoretically exact with correct V, B
+    """
+    print("=" * 70)
+    print("RHO COMPARISON: Gaussian vs Distance RBF on 2D Eikonal |∇u|=1")
+    print("=" * 70)
+
+    domain  = [(-1.0, 1.0), (-1.0, 1.0)]
+    x_src   = jnp.array([0.0, 0.0])
+    speed_fn = lambda x: jnp.ones((x.shape[0], 1))
+
+    source_pts, source_vals = source_ring_2d(x_src, eps, n_ring, c_at_src=1.0)
+    key, sk = jr.split(key)
+    interior_pts = _uniform_collocation_2d(sk, n_int, domain,
+                                           exclude_center=[0.0, 0.0],
+                                           min_dist=eps)
+    u_true_fn = lambda X1, X2: jnp.sqrt(X1 ** 2 + X2 ** 2)
+
+    configs = [
+        ("Gaussian k=50",      gaussian_rho, 50),
+        ("Distance RBF k=50",  distance_rho, 50),
+        ("Distance RBF k=1",   distance_rho,  1),
+    ]
+
+    results = []
+    for label, rho, k in configs:
+        print(f"\n--- {label} ---")
+        key, sk = jr.split(key)
+        init_params = init_splat_params(sk, k, 2, domain, scale=0.35)
+        params, history = train_eikonal_splat(
+            init_params, interior_pts, source_pts, source_vals, speed_fn,
+            num_steps=num_steps, lr=lr, physics_weight=1.0,
+            log_interval=num_steps // 4, rho=rho,
+        )
+        u_pred, X1, X2 = _eval_grid_2d(params, domain, rho=rho)
+        u_true = u_true_fn(X1, X2)
+        mse = float(jnp.mean((u_pred - u_true) ** 2))
+        print(f"  Grid MSE: {mse:.4e}")
+        results.append((label, rho, k, params, history, u_pred, mse))
+
+    # ---- Plot ---------------------------------------------------------------
+    levels = jnp.linspace(0.1, 1.3, 13)
+    extent = [-1, 1, -1, 1]
+    _, X1, X2 = _eval_grid_2d(results[0][3], domain, rho=results[0][1])
+    u_true = u_true_fn(X1, X2)
+    vmin, vmax = 0.0, float(jnp.max(u_true))
+
+    fig, axes = plt.subplots(3, 3, figsize=(15, 12))
+
+    # Row 0: analytical truth + the three predictions
+    for col, (label, rho, k, params, history, u_pred, mse) in enumerate(results):
+        ax_pred = axes[col][0]
+        im = ax_pred.imshow(u_pred, origin="lower", extent=extent,
+                            vmin=vmin, vmax=vmax, cmap="viridis", alpha=0.85)
+        ax_pred.contour(X1, X2, u_pred, levels=levels, colors="white",
+                        linewidths=0.8, alpha=0.9)
+        ax_pred.set_title(f"{label}\nMSE={mse:.2e}")
+        ax_pred.set_xlabel("$x_1$"); ax_pred.set_ylabel("$x_2$")
+        plt.colorbar(im, ax=ax_pred)
+        ax_pred.plot(*x_src, "r*", markersize=8)
+
+        ax_err = axes[col][1]
+        err = jnp.abs(u_pred - u_true)
+        im2 = ax_err.imshow(err, origin="lower", extent=extent,
+                             cmap="hot", vmin=0)
+        ax_err.set_title("|error|")
+        ax_err.set_xlabel("$x_1$"); ax_err.set_ylabel("$x_2$")
+        plt.colorbar(im2, ax=ax_err)
+
+        ax_loss = axes[col][2]
+        ax_loss.semilogy([h["total"] for h in history], lw=1.2, label="total")
+        ax_loss.semilogy([h["bc"]    for h in history], lw=1.2, label="BC")
+        ax_loss.semilogy([h["pde"]   for h in history], lw=1.2, label="PDE")
+        ax_loss.set_xlabel("step"); ax_loss.set_ylabel("loss")
+        ax_loss.set_title("Loss history"); ax_loss.legend(fontsize=7)
+        ax_loss.grid(True, alpha=0.3)
+
+    # Row labels
+    for row, (label, *_) in enumerate(results):
+        axes[row][0].set_ylabel(label + "\n$x_2$", fontsize=8)
+
+    fig.suptitle(
+        "Mother function comparison — 2D Eikonal |∇u|=1  (analytical: u=‖x‖)",
+        fontsize=13,
+    )
+    plt.tight_layout()
+    plt.savefig("eikonal_rho_comparison.png", dpi=150, bbox_inches="tight")
+    print("\n  Saved eikonal_rho_comparison.png")
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Eikonal SRM solver demo")
     parser.add_argument(
-        "--demo", choices=["uniform", "variable", "both"], default="both",
-        help="which demo to run",
+        "--demo", choices=["uniform", "variable", "both", "compare"],
+        default="both", help="which demo to run",
     )
     parser.add_argument("--k",     type=int,   default=100,  help="splat components")
     parser.add_argument("--steps", type=int,   default=2000, help="training steps")
@@ -420,5 +546,9 @@ if __name__ == "__main__":
     if args.demo in ("variable", "both"):
         key, sk = jr.split(key)
         demo_variable_speed_2d(sk, k=args.k, num_steps=args.steps, lr=args.lr)
+
+    if args.demo == "compare":
+        key, sk = jr.split(key)
+        demo_rho_comparison(sk, num_steps=args.steps, lr=args.lr)
 
     plt.show()
