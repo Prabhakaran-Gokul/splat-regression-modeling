@@ -257,7 +257,7 @@ def _eval_grid_2d(params, domain_bounds, Ng=80, rho=None):
 # Demo 1: 2D uniform speed — analytical solution available
 # ---------------------------------------------------------------------------
 
-def demo_uniform_speed_2d(key, k=100, n_int=1000, num_steps=2000, lr=1e-3,
+def demo_uniform_speed_2d(key, k=100, n_int=1500, num_steps=2000, lr=1e-3,
                            eps=0.08, n_ring=32, rho=None):
     """
     2D Eikonal |∇u| = 1 (c=1), source at origin.
