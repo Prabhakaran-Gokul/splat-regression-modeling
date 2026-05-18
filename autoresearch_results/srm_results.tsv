@@ -1,0 +1,41 @@
+iter	metric	delta	decision	description
+0	0.2930	-	baseline	Baseline: k=50, steps=2000, seed=42, V=|N(0,0.1)|, A=0.35*I, B=uniform, n_int=1000, n_ring=32, eps=0.08
+1	0.3188	+0.0258	discard	Halton sequence for B init (uniform coverage): worse
+2	0.3507	+0.0577	discard	Resample interior collocation points each step: worse (gradient variance)
+3	0.3074	+0.0144	discard	n_int 1000→2000: marginal worse
+4	0.4382	+0.1452	discard	Polar B init (disk placement for circular symmetry): worse
+5	0.2026	-0.0904	keep	V init ∝ (‖B‖+0.1): 30.8% improvement
+6	0.2064	+0.0038	discard	Pure V ∝ ‖B‖ without +0.1 offset: marginally worse than iter 5
+7	0.1903	-0.0123	keep	A scale 0.35→0.25 (tighter Gaussians): 6.1% improvement
+8	0.1821	-0.0082	keep	A scale 0.25→0.20: 4.3% improvement, trend continues
+11	9	0.1838	+0.0017	discard	A scale 0.20→0.15: marginally worse, reverted
+12	10	0.1422	-0.0399	keep	V init multiplier 0.1→0.15: 21.9 0mprovement
+13	11	0.0821	-0.0601	keep	V init multiplier 0.15→0.2: 42.2 0mprovement
+14	12	0.0769	-0.0052	keep	V init multiplier 0.2→0.3: 6.4 0mprovement
+15	13	0.8251	+0.7482	discard	V init multiplier 0.3→0.5: diverges, overshoot
+16	14	0.2764	+0.1995	discard	V init multiplier 0.3→0.4: worse, sweet spot confirmed at 0.3
+17	15	0.0769	0.0000	discard	n_ring 32→64: no improvement, BC ring density not bottleneck
+18	16	0.1096	+0.0327	discard	physics_weight 1.0→2.0: worse, BC balance disrupted
+19	17	0.0607	-0.0162	keep	lr 1e-3→3e-3: 21 0mprovement, better init tolerates higher LR
+20	18	0.0579	-0.0028	keep	lr 3e-3→5e-3: 4.6 0mprovement
+21	19	0.0580	+0.0001	discard	lr 5e-3→1e-2: no improvement, LR plateau at 5e-3
+22	20	0.0024	-0.0555	keep	k=50→100: 96% improvement; all init improvements carry forward at higher capacity
+23	21	0.00053	-0.00184	keep	k=200: MSE 5.3e-4, 78% improvement over k=100
+24	22	0.0056	+0.0051	discard	k=500: worse than k=200 (optimization harder in 2000 steps)
+25	23	0.0047	+0.0042	discard	k=300: worse than k=200, sweet spot at k=200 for 2000 steps
+26	25	0.000498	-0.000053	keep	AdamW(wd=1e-4) at k=200: 6.3% improvement
+27	26	0.000534	+0.000036	discard	AdamW wd=1e-3: worse than wd=1e-4
+28	27	27.77	+27.72	discard	squared-gradient loss (|∇u|²-1)²: diverges badly
+29	28	0.000699	+0.000201	discard	warmup 10%→20% steps: worse, shorter warmup preferred
+30	29	0.000565	+0.000067	discard	LR end_value 0.05→0.01: slightly worse, 0.05 tail preferred
+31	30	0.000718	+0.000220	discard	eps 0.08→0.05: worse, larger BC ring better
+32	31	0.00733	+0.00683	discard	gradient clipping norm=1.0: much worse, unconstrained grads preferred
+33	32	0.00320	+0.00270	discard	radius-proportional A scale: worse, constant scale preferred
+34	33	0.000347	-0.000151	keep	n_int 1000→1500: 30% improvement at k=200 (more collocation viable)
+35	34	0.0000752	-0.000272	keep	n_int 1500→2000: 78% improvement (more collocation still helps)
+36	35	0.000185	+0.000110	discard	n_int 2000→3000: worse (too many pts for 2000 steps), 2000 is sweet spot
+37	36	0.0000676	-0.0000076	keep	A scale re-tuned 0.20→0.25 at k=200 (better with n_int=2000): 10%
+38	37	0.000107	+0.000040	discard	A scale 0.25→0.30: worse, 0.25 is optimal
+39	38	0.0000636	-0.0000040	keep	V multiplier 0.3→0.35: 5.9% improvement
+40	39	0.0000752	+0.0000116	discard	V multiplier 0.35→0.40: worse, sweet spot at 0.35
+41	40	0.0000749	+0.0000113	discard	physics_weight 1.0→0.5: worse at k=200
