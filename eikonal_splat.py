@@ -187,13 +187,15 @@ def init_splat_params(key, k, d, domain_bounds, *, scale=0.3):
         scale:         diagonal entry of initial A matrices (spatial spread per splat)
     """
     kv, kb = jr.split(key)
-    V = jnp.abs(jr.normal(kv, (k, 1))) * 0.1
     A = jnp.tile(jnp.eye(d)[None] * scale, (k, 1, 1))
     ks = jr.split(kb, d)
     B = jnp.hstack([
         jr.uniform(ks[i], (k, 1), minval=lo, maxval=hi)
         for i, (lo, hi) in enumerate(domain_bounds)
     ])
+    # Scale V proportional to ‖B‖: splat at radius r should contribute ~r to u=‖x‖
+    r_B = jnp.linalg.norm(B, axis=-1, keepdims=True)   # [k, 1]
+    V = jnp.abs(jr.normal(kv, (k, 1))) * 0.1 * (r_B + 0.1)
     return V, A, B
 
 
