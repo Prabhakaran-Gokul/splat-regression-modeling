@@ -117,7 +117,7 @@ def train_eikonal_splat(
     warmup_steps = max(1, num_steps // 10)
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0, peak_value=lr, warmup_steps=warmup_steps,
-        decay_steps=num_steps, end_value=lr * 0.01,
+        decay_steps=num_steps, end_value=lr * 0.05,
     )
     optimizer = optax.adam(schedule)
     opt_state = optimizer.init(init_params)
