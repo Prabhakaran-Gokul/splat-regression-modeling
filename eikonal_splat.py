@@ -119,7 +119,7 @@ def train_eikonal_splat(
         init_value=0.0, peak_value=lr, warmup_steps=warmup_steps,
         decay_steps=num_steps, end_value=lr * 0.01,
     )
-    optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(schedule))
+    optimizer = optax.adam(schedule)
     opt_state = optimizer.init(init_params)
 
     # speed_fn and physics_weight captured from closure; step is JIT-compiled
