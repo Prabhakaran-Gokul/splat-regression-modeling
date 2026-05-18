@@ -173,11 +173,26 @@ def train_eikonal_splat(
     return params, history
 
 
+def _halton(n, base):
+    """Van der Corput sequence in given base, n points in [0,1)."""
+    seq = []
+    for i in range(1, n + 1):
+        f, r = 1.0, 0.0
+        j = i
+        while j > 0:
+            f /= base
+            r += f * (j % base)
+            j //= base
+        seq.append(r)
+    return seq
+
+
 def init_splat_params(key, k, d, domain_bounds, *, scale=0.3):
     """
     Initialise splat parameters for an Eikonal solver.
 
-    V ~ N(0, 0.01),  A = scale * I,  B uniform over domain.
+    V ~ |N(0, 0.1)|,  A = scale * I,  B placed on Halton sequence for
+    uniform domain coverage (bases 2 and 3 for dims 0 and 1).
 
     Args:
         key:           JAX random key
@@ -186,14 +201,15 @@ def init_splat_params(key, k, d, domain_bounds, *, scale=0.3):
         domain_bounds: list of (lo, hi) per dimension, e.g. [(-1,1), (-1,1)]
         scale:         diagonal entry of initial A matrices (spatial spread per splat)
     """
-    kv, kb = jr.split(key)
+    kv, _ = jr.split(key)
     V = jnp.abs(jr.normal(kv, (k, 1))) * 0.1
     A = jnp.tile(jnp.eye(d)[None] * scale, (k, 1, 1))
-    ks = jr.split(kb, d)
-    B = jnp.hstack([
-        jr.uniform(ks[i], (k, 1), minval=lo, maxval=hi)
-        for i, (lo, hi) in enumerate(domain_bounds)
-    ])
+    bases = [2, 3, 5, 7, 11, 13]
+    cols = []
+    for i, (lo, hi) in enumerate(domain_bounds):
+        h = jnp.array(_halton(k, bases[i % len(bases)]))
+        cols.append((h * (hi - lo) + lo)[:, None])
+    B = jnp.hstack(cols)
     return V, A, B
 
 
