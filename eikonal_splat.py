@@ -286,7 +286,7 @@ def demo_uniform_speed_2d(key, k=100, n_int=1000, num_steps=2000, lr=1e-3,
     speed_fn = lambda x: jnp.ones((x.shape[0], 1))
 
     key, sk = jr.split(key)
-    init_params = init_splat_params(sk, k, 2, domain, scale=0.35)
+    init_params = init_splat_params(sk, k, 2, domain, scale=0.25)
 
     params, history = train_eikonal_splat(
         init_params, interior_pts, source_pts, source_vals, speed_fn,
