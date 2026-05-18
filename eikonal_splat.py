@@ -265,7 +265,7 @@ def demo_uniform_speed_2d(key, k=100, n_int=1000, num_steps=2000, lr=1e-3,
 
     params, history = train_eikonal_splat(
         init_params, interior_pts, source_pts, source_vals, speed_fn,
-        num_steps=num_steps, lr=lr, physics_weight=1.0, log_interval=500,
+        num_steps=num_steps, lr=lr, physics_weight=5.0, log_interval=500,
     )
 
     u_pred, X1, X2 = _eval_grid_2d(params, domain)
