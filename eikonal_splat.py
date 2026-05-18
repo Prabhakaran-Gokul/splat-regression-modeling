@@ -166,11 +166,29 @@ def init_splat_params(key, k, d, domain_bounds, *, scale=0.3):
     kv, kb = jr.split(key)
     V = jr.normal(kv, (k, 1)) * 0.01
     A = jnp.tile(jnp.eye(d)[None] * scale, (k, 1, 1))
-    ks = jr.split(kb, d)
-    B = jnp.hstack([
-        jr.uniform(ks[i], (k, 1), minval=lo, maxval=hi)
-        for i, (lo, hi) in enumerate(domain_bounds)
-    ])
+    # Grid initialization for 2D: place centers on a uniform grid for better coverage.
+    # Falls back to random uniform for d != 2 or non-square k.
+    if d == 2:
+        g = int(jnp.round(jnp.sqrt(k)))
+        n_grid = g * g
+        axes = [jnp.linspace(lo + (hi - lo) / (2 * g), hi - (hi - lo) / (2 * g), g)
+                for lo, hi in domain_bounds]
+        grid = jnp.stack(jnp.meshgrid(*axes, indexing='ij'), axis=-1).reshape(-1, d)
+        if n_grid >= k:
+            B = grid[:k]
+        else:
+            ks = jr.split(kb, d)
+            extra = jnp.hstack([
+                jr.uniform(ks[i], (k - n_grid, 1), minval=lo, maxval=hi)
+                for i, (lo, hi) in enumerate(domain_bounds)
+            ])
+            B = jnp.vstack([grid, extra])
+    else:
+        ks = jr.split(kb, d)
+        B = jnp.hstack([
+            jr.uniform(ks[i], (k, 1), minval=lo, maxval=hi)
+            for i, (lo, hi) in enumerate(domain_bounds)
+        ])
     return V, A, B
 
 
