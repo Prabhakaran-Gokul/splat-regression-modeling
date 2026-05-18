@@ -37,6 +37,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import matplotlib.pyplot as plt
 import optax
+from flax import linen as nn
 from tqdm import tqdm
 
 from lib.splat import eval_splat
@@ -414,6 +415,200 @@ def demo_variable_speed_2d(key, k=100, n_int=1000, num_steps=2000, lr=1e-3,
 
 
 # ---------------------------------------------------------------------------
+# MLP baseline
+# ---------------------------------------------------------------------------
+
+class EikonalMLP(nn.Module):
+    """Fully-connected network with tanh activations for PINN use.
+
+    tanh is smooth everywhere and infinitely differentiable, which is
+    required for jax.grad to produce meaningful ∇u.
+    """
+    hidden: tuple = (32, 32)
+
+    @nn.compact
+    def __call__(self, x):
+        for h in self.hidden:
+            x = nn.Dense(h)(x)
+            x = nn.tanh(x)
+        return nn.Dense(1)(x)
+
+
+def count_params(params) -> int:
+    return sum(x.size for x in jax.tree_util.tree_leaves(params))
+
+
+def train_eikonal_mlp(
+    mlp,
+    interior_pts,
+    source_pts,
+    source_vals,
+    speed_fn,
+    init_key,
+    *,
+    num_steps=2000,
+    lr=1e-3,
+    physics_weight=1.0,
+    log_interval=500,
+):
+    """Train a Flax Linen MLP as a PINN on the Eikonal equation.
+
+    Identical loss, optimizer, and schedule to train_eikonal_splat so the
+    comparison is fair.
+    """
+    dummy = jnp.ones((1, interior_pts.shape[-1]))
+    params = mlp.init(init_key, dummy)
+    print(f"  MLP params: {count_params(params):,}")
+
+    warmup_steps = max(1, num_steps // 10)
+    schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0, peak_value=lr, warmup_steps=warmup_steps,
+        decay_steps=num_steps, end_value=lr * 0.05,
+    )
+    optimizer = optax.adam(schedule)
+    opt_state = optimizer.init(params)
+
+    def loss_fn(params):
+        def u_single(x):
+            return mlp.apply(params, x[None, :])[0, 0]
+
+        u_bc = mlp.apply(params, source_pts).squeeze(-1)
+        bc_loss = jnp.mean((u_bc - source_vals) ** 2)
+
+        grad_u = jax.vmap(jax.grad(u_single))(interior_pts)
+        grad_norm = jnp.sqrt(jnp.sum(grad_u ** 2, axis=-1) + 1e-12)
+        slowness = 1.0 / speed_fn(interior_pts).squeeze(-1)
+        pde_loss = jnp.mean((grad_norm - slowness) ** 2)
+
+        total = bc_loss + physics_weight * pde_loss
+        return total, (bc_loss, pde_loss)
+
+    @jax.jit
+    def step(params, opt_state):
+        (total, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+        updates, new_state = optimizer.update(grads, opt_state, params)
+        return optax.apply_updates(params, updates), new_state, total, aux
+
+    history = []
+    for i in tqdm(range(num_steps), desc="Eikonal MLP"):
+        params, opt_state, total, (bc, pde) = step(params, opt_state)
+        history.append({"total": float(total), "bc": float(bc), "pde": float(pde)})
+        if (i + 1) % log_interval == 0:
+            tqdm.write(
+                f"  {i+1:5d}/{num_steps}  "
+                f"total={total:.3e}  bc={bc:.3e}  pde={pde:.3e}"
+            )
+
+    return params, history
+
+
+# ---------------------------------------------------------------------------
+# SRM vs MLP comparison demo
+# ---------------------------------------------------------------------------
+
+def demo_srm_vs_mlp(key, num_steps=2000, lr=1e-3, k=50,
+                     eps=0.08, n_ring=32, n_int=1000,
+                     mlp_hidden=(32, 32)):
+    """Compare Gaussian SRM (k splats) vs MLP PINN on 2D uniform-speed Eikonal.
+
+    Both models use identical Adam+warmup+cosine schedule and the same
+    collocation / BC points.
+    """
+    print("=" * 70)
+    print(f"SRM vs MLP — 2D Eikonal |∇u|=1  (analytical: u=‖x‖)")
+    print(f"  SRM k={k}  |  MLP hidden={mlp_hidden}  |  steps={num_steps}")
+    print("=" * 70)
+
+    domain   = [(-1.0, 1.0), (-1.0, 1.0)]
+    x_src    = jnp.array([0.0, 0.0])
+    speed_fn = lambda x: jnp.ones((x.shape[0], 1))
+
+    source_pts, source_vals = source_ring_2d(x_src, eps, n_ring, c_at_src=1.0)
+    key, sk = jr.split(key)
+    interior_pts = _uniform_collocation_2d(sk, n_int, domain,
+                                           exclude_center=[0.0, 0.0],
+                                           min_dist=eps)
+
+    # --- SRM -----------------------------------------------------------------
+    print("\n--- Gaussian SRM ---")
+    key, sk = jr.split(key)
+    init_params = init_splat_params(sk, k, 2, domain, scale=0.35)
+    n_srm = sum(x.size for x in jax.tree_util.tree_leaves(init_params))
+    print(f"  SRM params: {n_srm:,}")
+    srm_params, srm_hist = train_eikonal_splat(
+        init_params, interior_pts, source_pts, source_vals, speed_fn,
+        num_steps=num_steps, lr=lr, physics_weight=1.0,
+        log_interval=num_steps // 4,
+    )
+    srm_u, X1, X2 = _eval_grid_2d(srm_params, domain)
+    u_true = jnp.sqrt(X1 ** 2 + X2 ** 2)
+    srm_mse = float(jnp.mean((srm_u - u_true) ** 2))
+    print(f"  Grid MSE: {srm_mse:.4e}")
+
+    # --- MLP -----------------------------------------------------------------
+    print("\n--- MLP ---")
+    mlp = EikonalMLP(hidden=mlp_hidden)
+    key, sk = jr.split(key)
+    mlp_params, mlp_hist = train_eikonal_mlp(
+        mlp, interior_pts, source_pts, source_vals, speed_fn, sk,
+        num_steps=num_steps, lr=lr, physics_weight=1.0,
+        log_interval=num_steps // 4,
+    )
+    g1 = jnp.linspace(*domain[0], 80)
+    g2 = jnp.linspace(*domain[1], 80)
+    G1, G2 = jnp.meshgrid(g1, g2)
+    grid_pts = jnp.stack([G1.ravel(), G2.ravel()], axis=1)
+    mlp_u = mlp.apply(mlp_params, grid_pts).reshape(80, 80)
+    mlp_mse = float(jnp.mean((mlp_u - u_true) ** 2))
+    print(f"  Grid MSE: {mlp_mse:.4e}")
+
+    # --- Plot ----------------------------------------------------------------
+    levels = jnp.linspace(0.1, 1.3, 13)
+    extent = [-1, 1, -1, 1]
+    vmin, vmax = 0.0, float(jnp.max(u_true))
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 9))
+    rows = [
+        (f"SRM Gaussian k={k}  ({n_srm} params)\nMSE={srm_mse:.2e}", srm_u, srm_hist),
+        (f"MLP tanh {mlp_hidden}  ({count_params(mlp_params)} params)\nMSE={mlp_mse:.2e}", mlp_u, mlp_hist),
+    ]
+    for row_i, (title, u_pred, hist) in enumerate(rows):
+        ax_pred = axes[row_i][0]
+        im = ax_pred.imshow(u_pred, origin="lower", extent=extent,
+                            vmin=vmin, vmax=vmax, cmap="viridis", alpha=0.85)
+        ax_pred.contour(X1, X2, u_pred, levels=levels, colors="white",
+                        linewidths=0.8, alpha=0.9)
+        ax_pred.set_title(title, fontsize=9)
+        ax_pred.set_xlabel("$x_1$"); ax_pred.set_ylabel("$x_2$")
+        plt.colorbar(im, ax=ax_pred)
+        ax_pred.plot(*x_src, "r*", markersize=8)
+
+        ax_err = axes[row_i][1]
+        err = jnp.abs(u_pred - u_true)
+        im2 = ax_err.imshow(err, origin="lower", extent=extent, cmap="hot", vmin=0)
+        ax_err.set_title("|error| vs u=‖x‖")
+        ax_err.set_xlabel("$x_1$"); ax_err.set_ylabel("$x_2$")
+        plt.colorbar(im2, ax=ax_err)
+
+        ax_loss = axes[row_i][2]
+        ax_loss.semilogy([h["total"] for h in hist], lw=1.2, label="total")
+        ax_loss.semilogy([h["bc"]    for h in hist], lw=1.2, label="BC")
+        ax_loss.semilogy([h["pde"]   for h in hist], lw=1.2, label="PDE")
+        ax_loss.set_xlabel("step"); ax_loss.set_ylabel("loss")
+        ax_loss.set_title("Loss history"); ax_loss.legend(fontsize=8)
+        ax_loss.grid(True, alpha=0.3)
+
+    fig.suptitle(
+        "Gaussian SRM vs MLP — 2D Eikonal PINN |∇u|=1  (analytical: u=‖x‖)",
+        fontsize=12,
+    )
+    plt.tight_layout()
+    plt.savefig("eikonal_srm_vs_mlp.png", dpi=150, bbox_inches="tight")
+    print("\n  Saved eikonal_srm_vs_mlp.png")
+    return srm_params, srm_hist, mlp_params, mlp_hist
+
+
+# ---------------------------------------------------------------------------
 # RHO comparison demo
 # ---------------------------------------------------------------------------
 
@@ -523,9 +718,11 @@ def demo_rho_comparison(key, num_steps=2000, lr=1e-3, eps=0.08, n_ring=32,
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Eikonal SRM solver demo")
     parser.add_argument(
-        "--demo", choices=["uniform", "variable", "both", "compare"],
+        "--demo", choices=["uniform", "variable", "both", "compare", "mlp"],
         default="both", help="which demo to run",
     )
+    parser.add_argument("--mlp-hidden", type=int, nargs="+", default=[32, 32],
+                        help="MLP hidden layer widths (e.g. --mlp-hidden 32 32 32)")
     parser.add_argument("--k",     type=int,   default=100,  help="splat components")
     parser.add_argument("--steps", type=int,   default=2000, help="training steps")
     parser.add_argument("--lr",    type=float, default=1e-3,  help="learning rate")
@@ -550,5 +747,10 @@ if __name__ == "__main__":
     if args.demo == "compare":
         key, sk = jr.split(key)
         demo_rho_comparison(sk, num_steps=args.steps, lr=args.lr)
+
+    if args.demo == "mlp":
+        key, sk = jr.split(key)
+        demo_srm_vs_mlp(sk, num_steps=args.steps, lr=args.lr, k=args.k,
+                         mlp_hidden=tuple(args.mlp_hidden))
 
     plt.show()
