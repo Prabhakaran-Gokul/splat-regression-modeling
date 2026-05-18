@@ -125,17 +125,11 @@ def train_eikonal_splat(
     # speed_fn and physics_weight captured from closure; step is JIT-compiled
     # once per call.  int_pts/src_pts/src_vals are dynamic arguments so they
     # can be swapped (e.g. for mini-batches) without recompilation.
-    ramp_steps = max(1, num_steps // 3)
-    pw_schedule = jnp.concatenate([
-        jnp.linspace(0.0, physics_weight, ramp_steps),
-        jnp.full(num_steps - ramp_steps, physics_weight),
-    ])
-
     @jax.jit
-    def step(params, opt_state, int_pts, src_pts, src_vals, pw):
+    def step(params, opt_state, int_pts, src_pts, src_vals):
         (total, aux), grads = jax.value_and_grad(
             eikonal_loss, has_aux=True
-        )(params, int_pts, src_pts, src_vals, speed_fn, pw)
+        )(params, int_pts, src_pts, src_vals, speed_fn, physics_weight)
         updates, new_state = optimizer.update(grads, opt_state, params)
         return optax.apply_updates(params, updates), new_state, total, aux
 
@@ -143,9 +137,8 @@ def train_eikonal_splat(
     history = []
 
     for i in tqdm(range(num_steps), desc="Eikonal SRM"):
-        pw = pw_schedule[i]
         params, opt_state, total, (bc, pde) = step(
-            params, opt_state, interior_pts, source_pts, source_vals, pw
+            params, opt_state, interior_pts, source_pts, source_vals
         )
         history.append({"total": float(total), "bc": float(bc), "pde": float(pde)})
         if (i + 1) % log_interval == 0:
