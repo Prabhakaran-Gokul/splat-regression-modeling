@@ -503,6 +503,164 @@ def train_eikonal_mlp(
 
 
 # ---------------------------------------------------------------------------
+# Fourier-feature MLP (ntrl-demo inspired)
+# ---------------------------------------------------------------------------
+
+class EikonalMLPFourier(nn.Module):
+    """MLP with random Fourier feature encoding to mitigate spectral bias.
+
+    Projects input x through a random matrix B, then applies sin/cos to get
+    a 2*fourier_dim dimensional feature vector before the MLP layers.
+    B is stored as a Flax param (survives serialization) and updated by the
+    optimizer — letting it adapt the frequency basis slightly.
+    """
+    hidden: tuple = (64, 64, 64)
+    fourier_dim: int = 128          # sin + cos → 2*fourier_dim features
+    fourier_scale: float = 1.0
+
+    @nn.compact
+    def __call__(self, x):
+        B = self.param('fourier_B',
+                       nn.initializers.normal(self.fourier_scale),
+                       (x.shape[-1], self.fourier_dim))
+        proj = x @ B                # [..., fourier_dim]
+        x = jnp.concatenate([jnp.sin(2 * jnp.pi * proj),
+                              jnp.cos(2 * jnp.pi * proj)], axis=-1)
+        for h in self.hidden:
+            x = nn.Dense(h)(x)
+            x = nn.tanh(x)
+        return nn.Dense(1)(x)
+
+
+# ---------------------------------------------------------------------------
+# Enhanced Eikonal loss (ntrl-demo inspired)
+# ---------------------------------------------------------------------------
+
+def eikonal_loss_enhanced(params, interior_pts, source_pts, source_vals,
+                           speed_fn, physics_weight, apply_fn,
+                           char_weight=1e-3, normal_weight=1e-3,
+                           char_step=0.03):
+    """
+    4-term Eikonal PINN loss inspired by the ntrl-demo methodology.
+
+    Terms:
+      1. BC loss  (standard mean-squared error on source ring)
+      2. Sqrt-form PDE residual  (√(|∇u|·c) − 1)²  weighted by exp(−0.5·u)
+         so near-source points (small u) dominate early training
+      3. Characteristic consistency  u(x) − u(x − δ·∇u/|∇u|) = δ
+         skipped where u < δ to avoid the singularity at the source
+      4. Normal loss at BC ring  ∇u/|∇u| ≈ x/|x|  (radially outward)
+
+    Args:
+        apply_fn: apply_fn(params, x: [d]) → scalar  (single-point evaluation)
+    """
+    def u_single(x):
+        return apply_fn(params, x)
+
+    # Interior evaluations
+    u_int     = jax.vmap(u_single)(interior_pts)            # [n]
+    grad_u    = jax.vmap(jax.grad(u_single))(interior_pts)  # [n, d]
+    grad_norm = jnp.sqrt(jnp.sum(grad_u ** 2, axis=-1) + 1e-12)
+    speed     = speed_fn(interior_pts).squeeze(-1)           # [n]
+
+    # 1. BC loss
+    u_bc    = jax.vmap(u_single)(source_pts)
+    bc_loss = jnp.mean((u_bc - source_vals) ** 2)
+
+    # 2. Sqrt-form Eikonal + exponential proximity weighting
+    eik_res  = (jnp.sqrt(jnp.clip(grad_norm * speed, 0.0)) - 1.0) ** 2
+    weights  = jnp.exp(-0.5 * jnp.abs(u_int))
+    pde_loss = jnp.mean(eik_res * weights)
+
+    # 3. Characteristic consistency
+    grad_dir = grad_u / grad_norm[:, None]
+    x_char   = interior_pts - char_step * grad_dir
+    u_char   = jax.vmap(u_single)(x_char)
+    char_res = (u_int - u_char - char_step) ** 2
+    tau_loss = jnp.mean(jnp.where(u_int < char_step, 0.0, char_res))
+
+    # 4. Normal loss at BC ring
+    grad_bc      = jax.vmap(jax.grad(u_single))(source_pts)
+    grad_bc_norm = jnp.sqrt(jnp.sum(grad_bc ** 2, axis=-1) + 1e-12)
+    grad_bc_dir  = grad_bc / grad_bc_norm[:, None]
+    radial_dir   = source_pts / (
+        jnp.linalg.norm(source_pts, axis=-1, keepdims=True) + 1e-12
+    )
+    normal_loss = jnp.mean(jnp.sum((grad_bc_dir - radial_dir) ** 2, axis=-1))
+
+    total = (bc_loss
+             + physics_weight * pde_loss
+             + char_weight * tau_loss
+             + normal_weight * normal_loss)
+    return total, (bc_loss, pde_loss, tau_loss, normal_loss)
+
+
+def train_eikonal_mlp_enhanced(
+    mlp,
+    interior_pts,
+    source_pts,
+    source_vals,
+    speed_fn,
+    init_key,
+    *,
+    num_steps=2000,
+    lr=5e-4,
+    physics_weight=1.0,
+    char_weight=1e-3,
+    normal_weight=1e-3,
+    char_step=0.03,
+    log_interval=500,
+):
+    """Train a Flax Linen MLP with the enhanced 4-term Eikonal loss.
+
+    Uses AdamW (weight_decay=0.01) with warmup+cosine schedule, matching the
+    spirit of ntrl-demo's training setup.
+    """
+    dummy  = jnp.ones((1, interior_pts.shape[-1]))
+    params = mlp.init(init_key, dummy)
+    print(f"  Enhanced MLP params: {count_params(params):,}")
+
+    warmup_steps = max(1, num_steps // 10)
+    schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0, peak_value=lr, warmup_steps=warmup_steps,
+        decay_steps=num_steps, end_value=lr * 0.05,
+    )
+    optimizer  = optax.adamw(schedule, weight_decay=0.01)
+    opt_state  = optimizer.init(params)
+
+    def apply_fn(p, x):
+        return mlp.apply(p, x[None, :])[0, 0]
+
+    def loss_fn(p):
+        return eikonal_loss_enhanced(
+            p, interior_pts, source_pts, source_vals, speed_fn,
+            physics_weight, apply_fn, char_weight, normal_weight, char_step,
+        )
+
+    @jax.jit
+    def step(params, opt_state):
+        (total, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+        updates, new_state = optimizer.update(grads, opt_state, params)
+        return optax.apply_updates(params, updates), new_state, total, aux
+
+    history = []
+    for i in tqdm(range(num_steps), desc="Enhanced MLP"):
+        params, opt_state, total, (bc, pde, tau, norm) = step(params, opt_state)
+        history.append({
+            "total": float(total), "bc": float(bc),
+            "pde": float(pde), "tau": float(tau), "norm": float(norm),
+        })
+        if (i + 1) % log_interval == 0:
+            tqdm.write(
+                f"  {i+1:5d}/{num_steps}  "
+                f"total={total:.3e}  bc={bc:.3e}  pde={pde:.3e}"
+                f"  tau={tau:.3e}  norm={norm:.3e}"
+            )
+
+    return params, history
+
+
+# ---------------------------------------------------------------------------
 # SRM vs MLP comparison demo
 # ---------------------------------------------------------------------------
 
@@ -712,13 +870,144 @@ def demo_rho_comparison(key, num_steps=2000, lr=1e-3, eps=0.08, n_ring=32,
 
 
 # ---------------------------------------------------------------------------
+# 3-way enhanced comparison demo
+# ---------------------------------------------------------------------------
+
+def demo_enhanced_comparison(key, num_steps=2000, lr=1e-3, k=50,
+                              eps=0.08, n_ring=32, n_int=1000,
+                              mlp_hidden=(32, 32),
+                              fourier_hidden=(64, 64, 64), fourier_dim=128):
+    """
+    Compare on 2D uniform-speed Eikonal (analytical u=‖x‖):
+      - Gaussian SRM (k splats, standard 2-term loss)
+      - Vanilla MLP  (tanh, standard 2-term loss)
+      - Fourier MLP  (random Fourier features, 4-term ntrl-demo loss)
+    """
+    print("=" * 70)
+    print("ENHANCED COMPARISON: SRM vs Vanilla MLP vs Fourier MLP")
+    print(f"  steps={num_steps}  k={k}  lr={lr}")
+    print("=" * 70)
+
+    domain   = [(-1.0, 1.0), (-1.0, 1.0)]
+    x_src    = jnp.array([0.0, 0.0])
+    speed_fn = lambda x: jnp.ones((x.shape[0], 1))
+
+    source_pts, source_vals = source_ring_2d(x_src, eps, n_ring, c_at_src=1.0)
+    key, sk = jr.split(key)
+    interior_pts = _uniform_collocation_2d(sk, n_int, domain,
+                                           exclude_center=[0.0, 0.0],
+                                           min_dist=eps)
+
+    g1 = jnp.linspace(*domain[0], 80)
+    g2 = jnp.linspace(*domain[1], 80)
+    G1, G2 = jnp.meshgrid(g1, g2)
+    grid_pts = jnp.stack([G1.ravel(), G2.ravel()], axis=1)
+    u_true = jnp.sqrt(G1 ** 2 + G2 ** 2)
+
+    # --- Gaussian SRM ---
+    print("\n--- Gaussian SRM ---")
+    key, sk = jr.split(key)
+    init_params = init_splat_params(sk, k, 2, domain, scale=0.35)
+    n_srm = sum(x.size for x in jax.tree_util.tree_leaves(init_params))
+    print(f"  SRM params: {n_srm:,}")
+    srm_params, srm_hist = train_eikonal_splat(
+        init_params, interior_pts, source_pts, source_vals, speed_fn,
+        num_steps=num_steps, lr=lr, physics_weight=1.0,
+        log_interval=num_steps // 4,
+    )
+    srm_u   = eval_splat(grid_pts, srm_params).reshape(80, 80)
+    srm_mse = float(jnp.mean((srm_u - u_true) ** 2))
+    print(f"  Grid MSE: {srm_mse:.4e}")
+
+    # --- Vanilla MLP ---
+    print("\n--- Vanilla MLP ---")
+    vanilla_mlp = EikonalMLP(hidden=mlp_hidden)
+    key, sk = jr.split(key)
+    vanilla_params, vanilla_hist = train_eikonal_mlp(
+        vanilla_mlp, interior_pts, source_pts, source_vals, speed_fn, sk,
+        num_steps=num_steps, lr=lr, physics_weight=1.0,
+        log_interval=num_steps // 4,
+    )
+    vanilla_u   = vanilla_mlp.apply(vanilla_params, grid_pts).reshape(80, 80)
+    vanilla_mse = float(jnp.mean((vanilla_u - u_true) ** 2))
+    print(f"  Grid MSE: {vanilla_mse:.4e}")
+
+    # --- Fourier MLP with enhanced loss ---
+    print("\n--- Fourier MLP (4-term enhanced loss) ---")
+    fourier_mlp = EikonalMLPFourier(hidden=fourier_hidden, fourier_dim=fourier_dim)
+    key, sk = jr.split(key)
+    fourier_params, fourier_hist = train_eikonal_mlp_enhanced(
+        fourier_mlp, interior_pts, source_pts, source_vals, speed_fn, sk,
+        num_steps=num_steps, lr=5e-4, physics_weight=1.0,
+        char_weight=1e-3, normal_weight=1e-3, char_step=0.03,
+        log_interval=num_steps // 4,
+    )
+    fourier_u   = fourier_mlp.apply(fourier_params, grid_pts).reshape(80, 80)
+    fourier_mse = float(jnp.mean((fourier_u - u_true) ** 2))
+    print(f"  Grid MSE: {fourier_mse:.4e}")
+
+    # --- Plot ---
+    levels  = jnp.linspace(0.1, 1.3, 13)
+    extent  = [-1, 1, -1, 1]
+    vmin, vmax = 0.0, float(jnp.max(u_true))
+    n_vanilla = count_params(vanilla_params)
+    n_fourier = count_params(fourier_params)
+
+    fig, axes = plt.subplots(3, 3, figsize=(15, 12))
+    rows = [
+        (f"Gaussian SRM k={k}  ({n_srm} params)\nMSE={srm_mse:.2e}",
+         srm_u, srm_hist, ["total", "bc", "pde"]),
+        (f"Vanilla MLP {mlp_hidden}  ({n_vanilla} params)\nMSE={vanilla_mse:.2e}",
+         vanilla_u, vanilla_hist, ["total", "bc", "pde"]),
+        (f"Fourier MLP {fourier_hidden}  ({n_fourier} params)\nMSE={fourier_mse:.2e}",
+         fourier_u, fourier_hist, ["total", "bc", "pde", "tau", "norm"]),
+    ]
+    for row_i, (title, u_pred, hist, loss_keys) in enumerate(rows):
+        ax_pred = axes[row_i][0]
+        im = ax_pred.imshow(u_pred, origin="lower", extent=extent,
+                            vmin=vmin, vmax=vmax, cmap="viridis", alpha=0.85)
+        ax_pred.contour(G1, G2, u_pred, levels=levels, colors="white",
+                        linewidths=0.8, alpha=0.9)
+        ax_pred.set_title(title, fontsize=9)
+        ax_pred.set_xlabel("$x_1$"); ax_pred.set_ylabel("$x_2$")
+        plt.colorbar(im, ax=ax_pred)
+        ax_pred.plot(*x_src, "r*", markersize=8)
+
+        ax_err = axes[row_i][1]
+        err = jnp.abs(u_pred - u_true)
+        im2 = ax_err.imshow(err, origin="lower", extent=extent, cmap="hot", vmin=0)
+        ax_err.set_title("|error| vs u=‖x‖")
+        ax_err.set_xlabel("$x_1$"); ax_err.set_ylabel("$x_2$")
+        plt.colorbar(im2, ax=ax_err)
+
+        ax_loss = axes[row_i][2]
+        for lk in loss_keys:
+            vals = [h[lk] for h in hist if lk in h]
+            if vals:
+                ax_loss.semilogy(vals, lw=1.2, label=lk)
+        ax_loss.set_xlabel("step"); ax_loss.set_ylabel("loss")
+        ax_loss.set_title("Loss history"); ax_loss.legend(fontsize=7)
+        ax_loss.grid(True, alpha=0.3)
+
+    fig.suptitle(
+        "SRM vs Vanilla MLP vs Fourier MLP (ntrl-demo enhanced)\n"
+        "2D Eikonal |∇u|=1  (analytical: u=‖x‖)",
+        fontsize=12,
+    )
+    plt.tight_layout()
+    plt.savefig("eikonal_enhanced_comparison.png", dpi=150, bbox_inches="tight")
+    print("\n  Saved eikonal_enhanced_comparison.png")
+    return srm_params, vanilla_params, fourier_params
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Eikonal SRM solver demo")
     parser.add_argument(
-        "--demo", choices=["uniform", "variable", "both", "compare", "mlp"],
+        "--demo", choices=["uniform", "variable", "both", "compare", "mlp", "enhanced"],
         default="both", help="which demo to run",
     )
     parser.add_argument("--mlp-hidden", type=int, nargs="+", default=[32, 32],
@@ -752,5 +1041,10 @@ if __name__ == "__main__":
         key, sk = jr.split(key)
         demo_srm_vs_mlp(sk, num_steps=args.steps, lr=args.lr, k=args.k,
                          mlp_hidden=tuple(args.mlp_hidden))
+
+    if args.demo == "enhanced":
+        key, sk = jr.split(key)
+        demo_enhanced_comparison(sk, num_steps=args.steps, lr=args.lr, k=args.k,
+                                  mlp_hidden=tuple(args.mlp_hidden))
 
     plt.show()
