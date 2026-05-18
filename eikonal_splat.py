@@ -115,7 +115,6 @@ def train_eikonal_splat(
     physics_weight=1.0,
     log_interval=500,
     rho=None,
-    resample_fn=None,
 ):
     """
     Train a splat model to solve the Eikonal equation.
@@ -161,9 +160,8 @@ def train_eikonal_splat(
     history = []
 
     for i in tqdm(range(num_steps), desc="Eikonal SRM"):
-        int_pts = resample_fn(i) if resample_fn is not None else interior_pts
         params, opt_state, total, (bc, pde) = step(
-            params, opt_state, int_pts, source_pts, source_vals
+            params, opt_state, interior_pts, source_pts, source_vals
         )
         history.append({"total": float(total), "bc": float(bc), "pde": float(pde)})
         if (i + 1) % log_interval == 0:
@@ -277,18 +275,11 @@ def demo_uniform_speed_2d(key, k=100, n_int=1000, num_steps=2000, lr=1e-3,
     # Source ring: u = eps on a circle of radius eps (c=1 near origin)
     source_pts, source_vals = source_ring_2d(x_src, eps, n_ring, c_at_src=1.0)
 
-    # Collocation points: resample fresh each step for broader coverage
+    # Collocation points strictly outside the ring
     key, sk = jr.split(key)
-    resample_base_key = sk
     interior_pts = _uniform_collocation_2d(sk, n_int, domain,
                                            exclude_center=[0.0, 0.0],
                                            min_dist=eps)
-
-    def resample_fn(step_i):
-        step_key = jr.fold_in(resample_base_key, step_i)
-        return _uniform_collocation_2d(step_key, n_int, domain,
-                                       exclude_center=[0.0, 0.0],
-                                       min_dist=eps)
 
     speed_fn = lambda x: jnp.ones((x.shape[0], 1))
 
@@ -298,7 +289,7 @@ def demo_uniform_speed_2d(key, k=100, n_int=1000, num_steps=2000, lr=1e-3,
     params, history = train_eikonal_splat(
         init_params, interior_pts, source_pts, source_vals, speed_fn,
         num_steps=num_steps, lr=lr, physics_weight=1.0, log_interval=500,
-        rho=rho, resample_fn=resample_fn,
+        rho=rho,
     )
 
     u_pred, X1, X2 = _eval_grid_2d(params, domain, rho=rho)
