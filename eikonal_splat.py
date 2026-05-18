@@ -1016,7 +1016,7 @@ if __name__ == "__main__":
                         help="MLP hidden layer widths (e.g. --mlp-hidden 32 32 32)")
     parser.add_argument("--k",     type=int,   default=100,  help="splat components")
     parser.add_argument("--steps", type=int,   default=2000, help="training steps")
-    parser.add_argument("--lr",    type=float, default=1e-3,  help="learning rate")
+    parser.add_argument("--lr",    type=float, default=3e-3,  help="learning rate")
     parser.add_argument("--seed",  type=int,   default=42)
     parser.add_argument("--gpu",   action="store_true", help="force GPU backend")
     args = parser.parse_args()
