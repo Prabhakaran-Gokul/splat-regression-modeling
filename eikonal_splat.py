@@ -173,41 +173,27 @@ def train_eikonal_splat(
     return params, history
 
 
-def init_splat_params(key, k, d, domain_bounds, *, scale=0.3, polar_B=False,
-                      polar_r_min=0.08, polar_r_max=1.42):
+def init_splat_params(key, k, d, domain_bounds, *, scale=0.3):
     """
     Initialise splat parameters for an Eikonal solver.
 
-    V ~ |N(0, 0.1)|,  A = scale * I.
-    B is initialised in polar coordinates when polar_B=True (2D only),
-    placing splat centres uniformly on a disk to match the circular
-    symmetry of the Eikonal solution u=‖x‖.  Otherwise B is uniform
-    over the rectangular domain.
+    V ~ N(0, 0.01),  A = scale * I,  B uniform over domain.
 
     Args:
         key:           JAX random key
         k:             number of splat components
         d:             spatial dimension
-        domain_bounds: list of (lo, hi) per dimension
-        scale:         diagonal entry of initial A matrices
-        polar_B:       if True and d==2, init B on a disk
-        polar_r_min:   minimum radius for polar B init
-        polar_r_max:   maximum radius for polar B init
+        domain_bounds: list of (lo, hi) per dimension, e.g. [(-1,1), (-1,1)]
+        scale:         diagonal entry of initial A matrices (spatial spread per splat)
     """
     kv, kb = jr.split(key)
     V = jnp.abs(jr.normal(kv, (k, 1))) * 0.1
     A = jnp.tile(jnp.eye(d)[None] * scale, (k, 1, 1))
-    if polar_B and d == 2:
-        kr, kt = jr.split(kb)
-        r     = jr.uniform(kr, (k,), minval=polar_r_min, maxval=polar_r_max)
-        theta = jr.uniform(kt, (k,), minval=0.0, maxval=2 * jnp.pi)
-        B     = jnp.stack([r * jnp.cos(theta), r * jnp.sin(theta)], axis=1)
-    else:
-        ks = jr.split(kb, d)
-        B = jnp.hstack([
-            jr.uniform(ks[i], (k, 1), minval=lo, maxval=hi)
-            for i, (lo, hi) in enumerate(domain_bounds)
-        ])
+    ks = jr.split(kb, d)
+    B = jnp.hstack([
+        jr.uniform(ks[i], (k, 1), minval=lo, maxval=hi)
+        for i, (lo, hi) in enumerate(domain_bounds)
+    ])
     return V, A, B
 
 
@@ -298,8 +284,7 @@ def demo_uniform_speed_2d(key, k=100, n_int=1000, num_steps=2000, lr=1e-3,
     speed_fn = lambda x: jnp.ones((x.shape[0], 1))
 
     key, sk = jr.split(key)
-    init_params = init_splat_params(sk, k, 2, domain, scale=0.35,
-                                    polar_B=True, polar_r_min=eps)
+    init_params = init_splat_params(sk, k, 2, domain, scale=0.35)
 
     params, history = train_eikonal_splat(
         init_params, interior_pts, source_pts, source_vals, speed_fn,
