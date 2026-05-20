@@ -64,39 +64,32 @@ def distance_rho(x):
 # ---------------------------------------------------------------------------
 
 def eikonal_loss(params, interior_pts, source_pts, source_vals, speed_fn,
-                 physics_weight, rho=None):
+                 physics_weight, rho=None, diag=False):
     """
     Physics-informed loss for the Eikonal equation.
 
     L = L_bc  +  physics_weight * L_pde
 
-    L_bc  = mean( (u(x_bc) − source_vals)² )
-    L_pde = mean( (|∇u(x)| − 1/c(x))² )
-
-    The (|∇u| − f) form (rather than |∇u|² − f²) gives better gradient
-    conditioning near the solution.  A small ε inside the sqrt avoids NaN
-    when ∇u ≈ 0 during the first few steps.
-
     Args:
-        params:       (V, A, B) splat parameters
-        interior_pts: [n_int, d]  PDE collocation points
-        source_pts:   [n_src, d]  BC points
-        source_vals:  [n_src]     target u values at source_pts
-        speed_fn:     c(x): [n, d] → [n, 1], JAX-traceable
+        params:         (V, A, B) splat parameters; A is [k,d,d] when diag=False,
+                        [k,d] (log-scale diagonal) when diag=True
+        interior_pts:   [n_int, d]
+        source_pts:     [n_src, d]
+        source_vals:    [n_src]
+        speed_fn:       c(x): [n, d] → [n, 1], JAX-traceable
         physics_weight: scalar weight on PDE term
-        rho:          mother function (None = Gaussian)
+        rho:            mother function (None = Gaussian)
+        diag:           if True, use diagonal-A eval_splat mode
     """
     def u_single(x):
-        return eval_splat(x[None, :], params, rho=rho)[0, 0]
+        return eval_splat(x[None, :], params, rho=rho, diag=diag)[0, 0]
 
-    # Boundary condition
-    u_bc = eval_splat(source_pts, params, rho=rho).squeeze(-1)   # [n_src]
-    bc_loss = jnp.mean((u_bc - source_vals) ** 2)
+    u_bc      = eval_splat(source_pts, params, rho=rho, diag=diag).squeeze(-1)
+    bc_loss   = jnp.mean((u_bc - source_vals) ** 2)
 
-    # PDE residual at interior collocation points
-    grad_u = jax.vmap(jax.grad(u_single))(interior_pts)          # [n_int, d]
-    grad_norm = jnp.sqrt(jnp.sum(grad_u ** 2, axis=-1) + 1e-12)  # [n_int]
-    slowness  = 1.0 / speed_fn(interior_pts).squeeze(-1)          # [n_int]
+    grad_u    = jax.vmap(jax.grad(u_single))(interior_pts)
+    grad_norm = jnp.sqrt(jnp.sum(grad_u ** 2, axis=-1) + 1e-12)
+    slowness  = 1.0 / speed_fn(interior_pts).squeeze(-1)
     pde_loss  = jnp.mean((grad_norm - slowness) ** 2)
 
     total = bc_loss + physics_weight * pde_loss
@@ -115,24 +108,36 @@ def train_eikonal_splat(
     physics_weight=1.0,
     log_interval=500,
     rho=None,
+    diag=False,
+    resample_fn=None,
+    key=None,
 ):
     """
     Train a splat model to solve the Eikonal equation.
 
     Args:
-        init_params:    (V, A, B) initial splat parameters; see init_splat_params
-        interior_pts:   [n_int, d] collocation points (PDE residual evaluated here)
-        source_pts:     [n_src, d] BC points
-        source_vals:    [n_src]    target u at source_pts (e.g. ε on a ring of radius ε)
-        speed_fn:       c(x): [n, d] → [n, 1], JAX-traceable speed field
+        init_params:    (V, A, B) initial parameters; A is [k,d,d] normally or
+                        [k,d] log-diagonal when diag=True
+        interior_pts:   [n_int, d] — used when resample_fn is None
+        source_pts:     [n_src, d]
+        source_vals:    [n_src]
+        speed_fn:       c(x): [n, d] → [n, 1]
         num_steps:      Adam iterations
-        lr:             learning rate
-        physics_weight: weight on PDE loss relative to BC loss
-        log_interval:   console print frequency
+        lr:             peak learning rate
+        physics_weight: weight on PDE loss
+        log_interval:   print frequency
+        rho:            mother function (None = Gaussian)
+        diag:           if True, use diagonal-A parameterisation
+        resample_fn:    optional callable (key) → [n_batch, d] that draws a
+                        fresh batch of collocation points each step.  When
+                        provided, interior_pts is ignored and the PDE is
+                        supervised on a new random sample every iteration —
+                        dynamic (online) collocation.
+        key:            JAX PRNGKey, required when resample_fn is not None.
 
     Returns:
-        params:   final trained (V, A, B)
-        history:  list of {'total', 'bc', 'pde'} dicts, one per step
+        params:  final (V, A, B)
+        history: list of {'total', 'bc', 'pde'} dicts
     """
     warmup_steps = max(1, num_steps // 10)
     schedule = optax.warmup_cosine_decay_schedule(
@@ -142,11 +147,9 @@ def train_eikonal_splat(
     optimizer = optax.adamw(schedule, weight_decay=1e-4)
     opt_state = optimizer.init(init_params)
 
-    # speed_fn, physics_weight, and rho captured from closure; step is
-    # JIT-compiled once per call.  int_pts/src_pts/src_vals are dynamic.
     def _loss(params, int_pts, src_pts, src_vals):
         return eikonal_loss(params, int_pts, src_pts, src_vals,
-                            speed_fn, physics_weight, rho)
+                            speed_fn, physics_weight, rho, diag)
 
     @jax.jit
     def step(params, opt_state, int_pts, src_pts, src_vals):
@@ -156,12 +159,18 @@ def train_eikonal_splat(
         updates, new_state = optimizer.update(grads, opt_state, params)
         return optax.apply_updates(params, updates), new_state, total, aux
 
-    params = init_params
+    params  = init_params
     history = []
 
     for i in tqdm(range(num_steps), desc="Eikonal SRM"):
+        if resample_fn is not None:
+            key, sk = jr.split(key)
+            int_pts_i = resample_fn(sk)
+        else:
+            int_pts_i = interior_pts
+
         params, opt_state, total, (bc, pde) = step(
-            params, opt_state, interior_pts, source_pts, source_vals
+            params, opt_state, int_pts_i, source_pts, source_vals
         )
         history.append({"total": float(total), "bc": float(bc), "pde": float(pde)})
         if (i + 1) % log_interval == 0:
@@ -1223,6 +1232,564 @@ def demo_obstacle_field(key, k=200, n_int=2000, num_steps=3000, lr=5e-3,
 
 
 # ---------------------------------------------------------------------------
+# d-dimensional helpers (d-agnostic; work for any d ≥ 1)
+# ---------------------------------------------------------------------------
+
+def source_sphere_nd(x_src, eps, n_pts, c_at_src):
+    """
+    Approximately uniform points on the (d-1)-sphere of radius eps around x_src.
+
+    Uses the standard trick: draw Z ~ N(0, I_d), normalise to unit sphere, scale
+    by eps.  Works for any d; for d=2 reduces to a uniform circle, for d=3 gives
+    a good uniform sphere distribution.
+
+    Args:
+        x_src:      [d] centre
+        eps:        sphere radius
+        n_pts:      number of BC points
+        c_at_src:   speed at source for BC value u = eps / c
+
+    Returns:
+        src_pts:  [n_pts, d]
+        src_vals: [n_pts]   all equal to eps / c_at_src
+    """
+    import numpy as np
+    rng = np.random.default_rng(0)
+    d = x_src.shape[0]
+    Z = rng.standard_normal((n_pts, d)).astype(np.float32)
+    Z /= np.linalg.norm(Z, axis=-1, keepdims=True) + 1e-12
+    pts = jnp.array(x_src) + eps * jnp.array(Z)
+    return pts, jnp.full(n_pts, eps / c_at_src)
+
+
+def _uniform_collocation_nd(key, n, domain_bounds, exclude_center, min_dist):
+    """Uniform random collocation in the d-dimensional domain, excluding a ball."""
+    d  = len(domain_bounds)
+    lo = jnp.array([b[0] for b in domain_bounds])
+    hi = jnp.array([b[1] for b in domain_bounds])
+    cands = jr.uniform(key, (n * 10, d)) * (hi - lo) + lo
+    dist  = jnp.linalg.norm(cands - jnp.array(exclude_center), axis=-1)
+    return cands[dist > min_dist][:n]
+
+
+def init_splat_params_diag(key, k, d, domain_bounds, scale=0.25):
+    """
+    Initialise diagonal-A splat parameters.
+
+    Returns (V, log_a, B) where:
+      V:     [k, 1]  — weights
+      log_a: [k, d]  — log(diagonal of A); exp(log_a) gives positive scales
+      B:     [k, d]  — centres, uniform over domain
+
+    The diagonal A parameterisation reduces A-parameter count from k*d² to k*d
+    and replaces the O(d³) linear solve with O(d) element-wise division,
+    making it practical for d ≥ 6.
+    """
+    kv, kb = jr.split(key)
+    ks   = jr.split(kb, d)
+    B    = jnp.hstack([
+        jr.uniform(ks[i], (k, 1), minval=lo, maxval=hi)
+        for i, (lo, hi) in enumerate(domain_bounds)
+    ])
+    log_a = jnp.full((k, d), jnp.log(scale))
+    r_B   = jnp.linalg.norm(B, axis=-1, keepdims=True)
+    V     = jnp.abs(jr.normal(kv, (k, 1))) * 0.35 * (r_B + 0.1)
+    return V, log_a, B
+
+
+# ---------------------------------------------------------------------------
+# 3-D helpers
+# ---------------------------------------------------------------------------
+
+def source_sphere_3d(x_src, eps, n_pts, c_at_src):
+    """
+    Fibonacci-lattice points on a sphere of radius eps around x_src.
+
+    The Fibonacci lattice gives approximately uniform angular coverage for any
+    n_pts without needing a random key.  Each point gets BC value eps/c_at_src,
+    which is the first-order travel-time approximation at distance eps.
+
+    Returns:
+        src_pts:  [n_pts, 3]
+        src_vals: [n_pts]
+    """
+    golden = (1.0 + 5.0 ** 0.5) / 2.0
+    i = jnp.arange(n_pts, dtype=jnp.float32)
+    theta = jnp.arccos(jnp.clip(1.0 - 2.0 * (i + 0.5) / n_pts, -1.0, 1.0))
+    phi = 2.0 * jnp.pi * i / golden
+    pts = x_src + eps * jnp.stack([
+        jnp.sin(theta) * jnp.cos(phi),
+        jnp.sin(theta) * jnp.sin(phi),
+        jnp.cos(theta),
+    ], axis=1)
+    return pts, jnp.full(n_pts, eps / c_at_src)
+
+
+def _uniform_collocation_3d(key, n, domain_bounds, exclude_center, min_dist):
+    lo = jnp.array([b[0] for b in domain_bounds])
+    hi = jnp.array([b[1] for b in domain_bounds])
+    cands = jr.uniform(key, (n * 10, 3)) * (hi - lo) + lo
+    dist  = jnp.linalg.norm(cands - jnp.array(exclude_center), axis=-1)
+    return cands[dist > min_dist][:n]
+
+
+def _eval_slices_3d(params, domain_bounds, Ng=60, rho=None):
+    """
+    Evaluate u on the three axis-aligned mid-plane slices.
+
+    Returns dict with keys 'xy', 'xz', 'yz'; each value is a tuple
+    (u_slice [Ng,Ng], grid_horiz [Ng,Ng], grid_vert [Ng,Ng]).
+    """
+    g0 = jnp.linspace(*domain_bounds[0], Ng)  # x
+    g1 = jnp.linspace(*domain_bounds[1], Ng)  # y
+    g2 = jnp.linspace(*domain_bounds[2], Ng)  # z
+    zero = jnp.zeros(Ng * Ng)
+
+    Gx, Gy = jnp.meshgrid(g0, g1)
+    u_xy = eval_splat(
+        jnp.stack([Gx.ravel(), Gy.ravel(), zero], axis=1), params, rho=rho,
+    ).reshape(Ng, Ng)
+
+    Gx2, Gz = jnp.meshgrid(g0, g2)
+    u_xz = eval_splat(
+        jnp.stack([Gx2.ravel(), zero, Gz.ravel()], axis=1), params, rho=rho,
+    ).reshape(Ng, Ng)
+
+    Gy2, Gz2 = jnp.meshgrid(g1, g2)
+    u_yz = eval_splat(
+        jnp.stack([zero, Gy2.ravel(), Gz2.ravel()], axis=1), params, rho=rho,
+    ).reshape(Ng, Ng)
+
+    return {
+        "xy": (u_xy, Gx,  Gy),
+        "xz": (u_xz, Gx2, Gz),
+        "yz": (u_yz, Gy2, Gz2),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Demo: 3-D uniform speed — analytical solution u=‖x‖
+# ---------------------------------------------------------------------------
+
+def demo_uniform_speed_3d(key, k=200, n_int=3000, num_steps=5000, lr=5e-3,
+                           eps=0.10, n_sphere=100, rho=None):
+    """
+    3-D Eikonal |∇u| = 1 (c=1), source at origin.
+    Analytical solution: u(x) = ‖x‖.
+
+    BC enforced on a Fibonacci sphere of radius eps.
+    Visualised via three axis-aligned mid-plane slices (z=0, y=0, x=0).
+    On each slice the isochrones are circles — the same as the 2-D case —
+    confirming the 3-D solver inherits the correct geometry.
+    """
+    print("=" * 60)
+    print("Demo: 3-D Eikonal |∇u|=1  (c=1, source at origin)")
+    print(f"  k={k}, n_int={n_int}, steps={num_steps}, lr={lr}")
+    print("=" * 60)
+
+    domain = [(-1.0, 1.0)] * 3
+    x_src  = jnp.zeros(3)
+
+    source_pts, source_vals = source_sphere_3d(x_src, eps, n_sphere, c_at_src=1.0)
+
+    key, sk = jr.split(key)
+    interior_pts = _uniform_collocation_3d(sk, n_int, domain,
+                                           exclude_center=[0., 0., 0.],
+                                           min_dist=eps)
+
+    speed_fn = lambda x: jnp.ones((x.shape[0], 1))
+
+    key, sk = jr.split(key)
+    init_params = init_splat_params(sk, k, 3, domain, scale=0.25)
+    n_params = sum(x.size for x in jax.tree_util.tree_leaves(init_params))
+    print(f"  SRM params: {n_params:,}")
+
+    params, history = train_eikonal_splat(
+        init_params, interior_pts, source_pts, source_vals, speed_fn,
+        num_steps=num_steps, lr=lr, physics_weight=1.0,
+        log_interval=500, rho=rho,
+    )
+
+    slices = _eval_slices_3d(params, domain, Ng=60, rho=rho)
+
+    # Analytical: u_true restricted to each midplane
+    u_true_slice = {
+        "xy": jnp.sqrt(slices["xy"][1] ** 2 + slices["xy"][2] ** 2),
+        "xz": jnp.sqrt(slices["xz"][1] ** 2 + slices["xz"][2] ** 2),
+        "yz": jnp.sqrt(slices["yz"][1] ** 2 + slices["yz"][2] ** 2),
+    }
+
+    mses = {s: float(jnp.mean((slices[s][0] - u_true_slice[s]) ** 2))
+            for s in ("xy", "xz", "yz")}
+    mean_mse = sum(mses.values()) / 3
+    print(f"  Slice MSE:  xy={mses['xy']:.3e}  xz={mses['xz']:.3e}  yz={mses['yz']:.3e}")
+    print(f"  Mean slice MSE: {mean_mse:.3e}")
+
+    # ── Plot ──────────────────────────────────────────────────────────────
+    from matplotlib.gridspec import GridSpec
+
+    levels = jnp.linspace(0.1, 1.3, 13)
+    extent = [-1, 1, -1, 1]
+    vmin, vmax = 0.0, 1.5
+
+    slice_meta = [
+        ("xy", "z = 0  (xy-plane)", r"$x_1$", r"$x_2$"),
+        ("xz", "y = 0  (xz-plane)", r"$x_1$", r"$x_3$"),
+        ("yz", "x = 0  (yz-plane)", r"$x_2$", r"$x_3$"),
+    ]
+
+    fig = plt.figure(figsize=(20, 13))
+    gs  = GridSpec(3, 4, figure=fig, hspace=0.38, wspace=0.32,
+                   width_ratios=[1, 1, 1, 1])
+    ax_loss = fig.add_subplot(gs[:, 3])  # loss panel spans all rows
+
+    for row, (sname, plane_label, xl, yl) in enumerate(slice_meta):
+        u_pred = slices[sname][0]
+        _, Gh, Gv = slices[sname]
+        u_true = u_true_slice[sname]
+
+        ax_t = fig.add_subplot(gs[row, 0])
+        im = ax_t.imshow(u_true, origin="lower", extent=extent,
+                         vmin=vmin, vmax=vmax, cmap="viridis", alpha=0.85)
+        ax_t.contour(Gh, Gv, u_true, levels=levels, colors="white",
+                     linewidths=0.7, alpha=0.85)
+        ax_t.set_title(f"Analytical  [{plane_label}]", fontsize=9)
+        ax_t.set_xlabel(xl); ax_t.set_ylabel(yl)
+        fig.colorbar(im, ax=ax_t, label="u(x)")
+
+        ax_p = fig.add_subplot(gs[row, 1])
+        im2 = ax_p.imshow(u_pred, origin="lower", extent=extent,
+                          vmin=vmin, vmax=vmax, cmap="viridis", alpha=0.85)
+        ax_p.contour(Gh, Gv, u_pred, levels=levels, colors="white",
+                     linewidths=0.7, alpha=0.85)
+        ax_p.set_title(f"SRM k={k}  MSE={mses[sname]:.1e}", fontsize=9)
+        ax_p.set_xlabel(xl); ax_p.set_ylabel(yl)
+        fig.colorbar(im2, ax=ax_p, label="u(x)")
+
+        ax_e = fig.add_subplot(gs[row, 2])
+        im3 = ax_e.imshow(jnp.abs(u_pred - u_true), origin="lower",
+                          extent=extent, cmap="hot", vmin=0)
+        ax_e.set_title("|error|", fontsize=9)
+        ax_e.set_xlabel(xl); ax_e.set_ylabel(yl)
+        fig.colorbar(im3, ax=ax_e)
+
+    ax_loss.semilogy([h["total"] for h in history], lw=1.2, label="total")
+    ax_loss.semilogy([h["bc"]    for h in history], lw=1.2, label="BC")
+    ax_loss.semilogy([h["pde"]   for h in history], lw=1.2, label="PDE")
+    ax_loss.set_xlabel("step"); ax_loss.set_ylabel("loss")
+    ax_loss.set_title("Loss history", fontsize=10)
+    ax_loss.legend(fontsize=9); ax_loss.grid(True, alpha=0.3)
+
+    fig.suptitle(
+        f"3-D Eikonal PINN  |∇u|=1  (analytical: u=‖x‖)\n"
+        f"Gaussian SRM  k={k},  {n_params} params  —  mean slice MSE = {mean_mse:.3e}",
+        fontsize=12,
+    )
+    plt.savefig("eikonal_uniform_speed_3d.png", dpi=150, bbox_inches="tight")
+    print("  Saved eikonal_uniform_speed_3d.png")
+    return params, history
+
+
+# ---------------------------------------------------------------------------
+# Demo: 3-D variable speed
+# ---------------------------------------------------------------------------
+
+def demo_variable_speed_3d(key, k=200, n_int=3000, num_steps=5000, lr=5e-3,
+                            eps=0.10, n_sphere=100):
+    """
+    3-D Eikonal with c(x) = 1 + 0.8·exp(−‖x‖²/0.2), source at origin.
+
+    Faster near the centre — isochrones bunch inward.  No closed-form solution;
+    quality measured by the PDE residual on the collocation set.
+    Visualised via the three axis-aligned mid-plane slices.
+    """
+    print("=" * 60)
+    print("Demo: 3-D Eikonal  variable speed  c(x)=1+0.8·exp(−‖x‖²/0.2)")
+    print(f"  k={k}, n_int={n_int}, steps={num_steps}, lr={lr}")
+    print("=" * 60)
+
+    domain = [(-1.0, 1.0)] * 3
+    x_src  = jnp.zeros(3)
+
+    def speed_fn(x):
+        r2 = jnp.sum(x ** 2, axis=-1, keepdims=True)
+        return 1.0 + 0.8 * jnp.exp(-r2 / 0.2)
+
+    c_src = float(speed_fn(x_src[None, :])[0, 0])
+    source_pts, source_vals = source_sphere_3d(x_src, eps, n_sphere, c_at_src=c_src)
+
+    key, sk = jr.split(key)
+    interior_pts = _uniform_collocation_3d(sk, n_int, domain,
+                                           exclude_center=[0., 0., 0.],
+                                           min_dist=eps)
+
+    key, sk = jr.split(key)
+    init_params = init_splat_params(sk, k, 3, domain, scale=0.35)
+    n_params = sum(x.size for x in jax.tree_util.tree_leaves(init_params))
+    print(f"  SRM params: {n_params:,}")
+
+    params, history = train_eikonal_splat(
+        init_params, interior_pts, source_pts, source_vals, speed_fn,
+        num_steps=num_steps, lr=lr, physics_weight=1.0, log_interval=500,
+    )
+
+    # PDE residual check on collocation pts
+    def u_single(x):
+        return eval_splat(x[None, :], params)[0, 0]
+
+    grad_u    = jax.vmap(jax.grad(u_single))(interior_pts)
+    grad_norm = jnp.sqrt(jnp.sum(grad_u ** 2, axis=-1))
+    slowness  = 1.0 / speed_fn(interior_pts).squeeze(-1)
+    pde_err   = float(jnp.mean((grad_norm - slowness) ** 2))
+    print(f"  PDE residual L² on collocation pts: {pde_err:.4e}")
+
+    slices = _eval_slices_3d(params, domain, Ng=60)
+
+    # Speed field on each midplane for visualisation
+    g = jnp.linspace(-1.0, 1.0, 60)
+    Gh, Gv = jnp.meshgrid(g, g)
+    zero60 = jnp.zeros(60 * 60)
+
+    spd_xy = speed_fn(
+        jnp.stack([Gh.ravel(), Gv.ravel(), zero60], axis=1)
+    ).reshape(60, 60)
+    spd_xz = speed_fn(
+        jnp.stack([Gh.ravel(), zero60, Gv.ravel()], axis=1)
+    ).reshape(60, 60)
+    spd_yz = speed_fn(
+        jnp.stack([zero60, Gh.ravel(), Gv.ravel()], axis=1)
+    ).reshape(60, 60)
+    speed_slices = {"xy": spd_xy, "xz": spd_xz, "yz": spd_yz}
+
+    # Normalise colourbar across solution slices
+    u_vals = jnp.concatenate([slices[s][0].ravel() for s in ("xy", "xz", "yz")])
+    vmin_u, vmax_u = 0.0, float(jnp.percentile(u_vals, 97))
+    levels = jnp.linspace(float(source_vals[0]) + 0.02, vmax_u * 0.9, 14)
+    extent = [-1, 1, -1, 1]
+
+    slice_meta = [
+        ("xy", "z = 0  (xy-plane)", r"$x_1$", r"$x_2$"),
+        ("xz", "y = 0  (xz-plane)", r"$x_1$", r"$x_3$"),
+        ("yz", "x = 0  (yz-plane)", r"$x_2$", r"$x_3$"),
+    ]
+
+    from matplotlib.gridspec import GridSpec
+
+    fig = plt.figure(figsize=(20, 13))
+    gs  = GridSpec(3, 4, figure=fig, hspace=0.38, wspace=0.32,
+                   width_ratios=[1, 1, 1, 1])
+    ax_loss = fig.add_subplot(gs[:, 3])
+
+    for row, (sname, plane_label, xl, yl) in enumerate(slice_meta):
+        u_pred = slices[sname][0]
+        _, Gh_s, Gv_s = slices[sname]
+        spd = speed_slices[sname]
+
+        ax_c = fig.add_subplot(gs[row, 0])
+        im0 = ax_c.imshow(spd, origin="lower", extent=extent, cmap="hot",
+                          vmin=1.0, vmax=1.8)
+        ax_c.set_title(f"Speed c(x)  [{plane_label}]", fontsize=9)
+        ax_c.set_xlabel(xl); ax_c.set_ylabel(yl)
+        fig.colorbar(im0, ax=ax_c, label="c(x)")
+
+        ax_p = fig.add_subplot(gs[row, 1])
+        im1 = ax_p.imshow(u_pred, origin="lower", extent=extent,
+                          vmin=vmin_u, vmax=vmax_u, cmap="viridis", alpha=0.85)
+        ax_p.contour(Gh_s, Gv_s, u_pred, levels=levels,
+                     colors="white", linewidths=0.7, alpha=0.85)
+        ax_p.set_title(f"SRM travel time  [{plane_label}]", fontsize=9)
+        ax_p.set_xlabel(xl); ax_p.set_ylabel(yl)
+        fig.colorbar(im1, ax=ax_p, label="u(x)")
+
+        # PDE residual field on this slice (computed via finite differences
+        # on the grid — a visual quality check only)
+        du_dh = jnp.gradient(u_pred, axis=1) / (2.0 / 60)
+        du_dv = jnp.gradient(u_pred, axis=0) / (2.0 / 60)
+        pde_res_slice = jnp.abs(jnp.sqrt(du_dh ** 2 + du_dv ** 2 + 1e-12)
+                                - 1.0 / spd)
+
+        ax_r = fig.add_subplot(gs[row, 2])
+        im2 = ax_r.imshow(pde_res_slice, origin="lower", extent=extent,
+                          cmap="hot", vmin=0)
+        ax_r.set_title("|PDE residual| (FD check)", fontsize=9)
+        ax_r.set_xlabel(xl); ax_r.set_ylabel(yl)
+        fig.colorbar(im2, ax=ax_r)
+
+    ax_loss.semilogy([h["total"] for h in history], lw=1.2, label="total")
+    ax_loss.semilogy([h["bc"]    for h in history], lw=1.2, label="BC")
+    ax_loss.semilogy([h["pde"]   for h in history], lw=1.2, label="PDE")
+    ax_loss.set_xlabel("step"); ax_loss.set_ylabel("loss")
+    ax_loss.set_title("Loss history", fontsize=10)
+    ax_loss.legend(fontsize=9); ax_loss.grid(True, alpha=0.3)
+
+    fig.suptitle(
+        f"3-D Eikonal PINN  —  variable speed c(x)=1+0.8·exp(−‖x‖²/0.2)\n"
+        f"Gaussian SRM  k={k},  {n_params} params  —  "
+        f"PDE residual (Adam pts) = {pde_err:.2e}",
+        fontsize=12,
+    )
+    plt.savefig("eikonal_variable_speed_3d.png", dpi=150, bbox_inches="tight")
+    print("  Saved eikonal_variable_speed_3d.png")
+    return params, history
+
+
+# ---------------------------------------------------------------------------
+# n-D canonical evaluation helpers
+# ---------------------------------------------------------------------------
+
+def _canonical_slice_mse(params, domain_bounds, Ng=60, rho=None, diag=False):
+    """
+    MSE on the canonical 2-D slice  {x_3=…=x_d=0}  vs  u_true = √(x₁²+x₂²).
+
+    Works for any d ≥ 2.  For d=2 this is the full domain; for d>2 it is one
+    axis-aligned cross-section.
+    """
+    g = jnp.linspace(domain_bounds[0][0], domain_bounds[0][1], Ng)
+    Gx, Gy = jnp.meshgrid(g, g)
+    zeros  = jnp.zeros((Ng * Ng, len(domain_bounds) - 2))
+    pts    = jnp.concatenate([Gx.ravel()[:, None], Gy.ravel()[:, None], zeros], axis=1)
+    u_pred = eval_splat(pts, params, rho=rho, diag=diag).reshape(Ng, Ng)
+    u_true = jnp.sqrt(Gx ** 2 + Gy ** 2)
+    return float(jnp.mean((u_pred - u_true) ** 2)), u_pred, Gx, Gy
+
+
+def _pde_residual_nd(params, interior_pts, speed_fn, rho=None, diag=False):
+    """PDE residual L² on the given collocation points."""
+    def u_single(x):
+        return eval_splat(x[None, :], params, rho=rho, diag=diag)[0, 0]
+
+    grad_u    = jax.vmap(jax.grad(u_single))(interior_pts)
+    grad_norm = jnp.sqrt(jnp.sum(grad_u ** 2, axis=-1) + 1e-12)
+    slowness  = 1.0 / speed_fn(interior_pts).squeeze(-1)
+    return float(jnp.mean((grad_norm - slowness) ** 2))
+
+
+# ---------------------------------------------------------------------------
+# Demo: Full-A vs Diagonal-A in d dimensions
+# ---------------------------------------------------------------------------
+
+def demo_diag_vs_full_nd(key, d=6, k=200, n_int=8000, num_steps=5000, lr=5e-3,
+                          eps=0.10, n_sphere=200):
+    """
+    Train full-A SRM and diagonal-A SRM on the d-D uniform-speed Eikonal
+    (analytical solution u=‖x‖), then compare:
+      - Canonical 2-D slice MSE (x₃=…=x_d=0)
+      - PDE residual L² on collocation points
+      - Training wall time
+      - Parameter counts
+
+    Saves: eikonal_diag_vs_full_d{d}.png
+    """
+    print("=" * 60)
+    print(f"Demo: full-A vs diagonal-A  d={d}  k={k}  n_int={n_int}")
+    print("=" * 60)
+
+    domain   = [(-1.0, 1.0)] * d
+    x_src    = jnp.zeros(d)
+    speed_fn = lambda x: jnp.ones((x.shape[0], 1))
+
+    src_pts, src_vals = source_sphere_nd(x_src, eps, n_sphere, c_at_src=1.0)
+
+    key, sk = jr.split(key)
+    int_pts = _uniform_collocation_nd(sk, n_int, domain,
+                                      exclude_center=[0.] * d, min_dist=eps)
+
+    results = {}
+    for label, use_diag in [("Full-A", False), ("Diagonal-A", True)]:
+        print(f"\n--- {label} ---")
+        key, sk = jr.split(key)
+        if use_diag:
+            init_p = init_splat_params_diag(sk, k, d, domain, scale=0.25)
+        else:
+            init_p = init_splat_params(sk, k, d, domain, scale=0.25)
+
+        n_params = sum(x.size for x in jax.tree_util.tree_leaves(init_p))
+        print(f"  params: {n_params:,}")
+
+        def _loss(params, int_pts, src_pts, src_vals):
+            return eikonal_loss(params, int_pts, src_pts, src_vals,
+                                speed_fn, physics_weight=1.0,
+                                rho=None, diag=use_diag)
+
+        import time
+        t0 = time.time()
+        params, history = train_eikonal_splat(
+            init_p, int_pts, src_pts, src_vals, speed_fn,
+            num_steps=num_steps, lr=lr, physics_weight=1.0,
+            log_interval=num_steps // 5, rho=None, diag=use_diag,
+        )
+        elapsed = time.time() - t0
+
+        slice_mse, u_pred, Gx, Gy = _canonical_slice_mse(
+            params, domain, diag=use_diag)
+        pde_res = _pde_residual_nd(params, int_pts, speed_fn, diag=use_diag)
+
+        print(f"  Canonical slice MSE: {slice_mse:.4e}")
+        print(f"  PDE residual L²:     {pde_res:.4e}")
+        print(f"  Wall time:           {elapsed:.1f}s")
+
+        results[label] = dict(
+            history=history, u_pred=u_pred, Gx=Gx, Gy=Gy,
+            slice_mse=slice_mse, pde_res=pde_res, elapsed=elapsed,
+            n_params=n_params,
+        )
+
+    # ── Plot ──────────────────────────────────────────────────────────────
+    u_true = jnp.sqrt(results["Full-A"]["Gx"] ** 2 + results["Full-A"]["Gy"] ** 2)
+    levels = jnp.linspace(0.1, 1.3, 13)
+    extent = [-1, 1, -1, 1]
+    vmin, vmax = 0.0, 1.5
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 9))
+
+    for col, (label, r) in enumerate(results.items()):
+        ax_pred = axes[0][col]
+        im = ax_pred.imshow(r["u_pred"], origin="lower", extent=extent,
+                            vmin=vmin, vmax=vmax, cmap="viridis", alpha=0.85)
+        ax_pred.contour(r["Gx"], r["Gy"], r["u_pred"], levels=levels,
+                        colors="white", linewidths=0.7, alpha=0.85)
+        ax_pred.set_title(
+            f"{label}  ({r['n_params']:,} params)\n"
+            f"slice MSE={r['slice_mse']:.2e}  PDE={r['pde_res']:.2e}"
+            f"  {r['elapsed']:.0f}s",
+            fontsize=9,
+        )
+        ax_pred.set_xlabel(r"$x_1$"); ax_pred.set_ylabel(r"$x_2$")
+        fig.colorbar(im, ax=ax_pred, label="u")
+
+        ax_err = axes[1][col]
+        err = jnp.abs(r["u_pred"] - u_true)
+        im2 = ax_err.imshow(err, origin="lower", extent=extent, cmap="hot", vmin=0)
+        ax_err.set_title("|error| on canonical slice", fontsize=9)
+        ax_err.set_xlabel(r"$x_1$"); ax_err.set_ylabel(r"$x_2$")
+        fig.colorbar(im2, ax=ax_err)
+
+    # Loss curves in the rightmost column
+    ax_loss = axes[0][2]
+    for label, r in results.items():
+        ax_loss.semilogy([h["total"] for h in r["history"]], lw=1.5, label=label)
+    ax_loss.set_xlabel("step"); ax_loss.set_ylabel("loss")
+    ax_loss.set_title("Total loss history"); ax_loss.legend(); ax_loss.grid(True, alpha=0.3)
+
+    ax_pde = axes[1][2]
+    for label, r in results.items():
+        ax_pde.semilogy([h["pde"] for h in r["history"]], lw=1.5, label=label)
+    ax_pde.set_xlabel("step"); ax_pde.set_ylabel("PDE loss")
+    ax_pde.set_title("PDE loss history"); ax_pde.legend(); ax_pde.grid(True, alpha=0.3)
+
+    fig.suptitle(
+        f"Full-A vs Diagonal-A SRM  —  {d}-D Eikonal |∇u|=1  (k={k}, n_int={n_int})\n"
+        f"Canonical slice = x_3=…=x_{d}=0, compared to u=√(x₁²+x₂²)",
+        fontsize=12,
+    )
+    plt.tight_layout()
+    fname = f"eikonal_diag_vs_full_d{d}.png"
+    plt.savefig(fname, dpi=150, bbox_inches="tight")
+    print(f"\n  Saved {fname}")
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1230,12 +1797,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Eikonal SRM solver demo")
     parser.add_argument(
         "--demo",
-        choices=["uniform", "variable", "both", "compare", "mlp", "enhanced", "obstacle"],
+        choices=["uniform", "variable", "both", "compare", "mlp", "enhanced",
+                 "obstacle", "uniform3d", "variable3d", "3d"],
         default="both", help="which demo to run",
     )
     parser.add_argument("--mlp-hidden", type=int, nargs="+", default=[32, 32],
                         help="MLP hidden layer widths (e.g. --mlp-hidden 32 32 32)")
     parser.add_argument("--k",     type=int,   default=100,  help="splat components")
+    parser.add_argument("--n-int", type=int,   default=None, help="collocation points (3-D demos)")
     parser.add_argument("--steps", type=int,   default=2000, help="training steps")
     parser.add_argument("--lr",    type=float, default=5e-3,  help="learning rate")
     parser.add_argument("--seed",  type=int,   default=42)
@@ -1273,5 +1842,19 @@ if __name__ == "__main__":
     if args.demo == "obstacle":
         key, sk = jr.split(key)
         demo_obstacle_field(sk, k=args.k, num_steps=args.steps, lr=args.lr)
+
+    if args.demo in ("uniform3d", "3d"):
+        k3   = args.k     if args.k     != 100  else 200
+        st3  = args.steps if args.steps != 2000 else 5000
+        ni3  = args.n_int if args.n_int is not None else 3000
+        key, sk = jr.split(key)
+        demo_uniform_speed_3d(sk, k=k3, n_int=ni3, num_steps=st3, lr=args.lr)
+
+    if args.demo in ("variable3d", "3d"):
+        k3   = args.k     if args.k     != 100  else 200
+        st3  = args.steps if args.steps != 2000 else 5000
+        ni3  = args.n_int if args.n_int is not None else 3000
+        key, sk = jr.split(key)
+        demo_variable_speed_3d(sk, k=k3, n_int=ni3, num_steps=st3, lr=args.lr)
 
     plt.show()
