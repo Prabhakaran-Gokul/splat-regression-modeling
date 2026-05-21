@@ -13,83 +13,51 @@ from flax import linen as nn
 from jaxkan.models.KAN import KAN
 from tqdm import tqdm
 
-@partial(jax.jit, static_argnames=('rho',))
-def eval_splat(X, splatnn, rho=None, eps=1e-6):
+@partial(jax.jit, static_argnames=('rho', 'diag'))
+def eval_splat(X, splatnn, rho=None, diag=False, eps=1e-6):
     '''
     X: [n,d] real tensor
-    splatnn: tuple of (V,A,B) where V is a [k,p] real tensor, A is a [k,d,d] real tensor, B is a [k,d] real tensor
-    rho: a real valued function with real tensor [n,d] input
+    splatnn: tuple of (V, A, B) where
+        full mode (diag=False): A is [k,d,d]
+        diag mode (diag=True):  A is [k,d] storing log-scale diagonal entries
+    rho: a real valued function with real tensor [...,d] input
 
-    splatnn is a splat neural network parameters and rho is a mother splat function.  
-    Returns: a [n,p] real tensor Y where Y[i,:] = sum_{j=1...k} V[j,:] * rho_{A[j,:,:], B[j,:]}(X[i,:])
-    where rho_{A,B}(x) = det(A)^(-1) * rho(A^(-1) * (x-B))
+    Returns: [n,p] tensor  Y[i,:] = sum_j V[j,:] * rho_{A[j],B[j]}(X[i,:])
+    where  rho_{A,B}(x) = det(A)^{-1} * rho(A^{-1}(x-B))
+
+    diag=True mode:
+      A is stored as log(diag(A)), shape [k,d].
+      The transformation becomes element-wise division: A^{-1}(x-B) = (x-B)/exp(A).
+      Cost: O(n*k*d) vs O(n*k*d^3) for the full solve — critical for d>=6.
     '''
-    V, A, B = splatnn
-    assert X.ndim == 2, f"X must be a [n,d] tensor, but has shape {X.shape}"
-    assert V.ndim == 2, f"V must be a [k,p] tensor, but has shape {V.shape}"
-    assert A.ndim == 3, f"A must be a [k,d,d] tensor, but has shape {A.shape}"
-    assert B.ndim == 2, f"B must be a [k,d] tensor, but has shape {B.shape}"
+    V, A_or_a, B = splatnn
     n, d = X.shape
     k, p = V.shape
-    assert A.shape[0] == k, f"A's first dimension must be k={k}, but is {A.shape[0]}"
-    assert A.shape[2] == d, f"A's third dimension must be d={d}, but is {A.shape[2]}"
-    assert B.shape[0] == k, f"B's first dimension must be k={k}, but is {B.shape[0]}"
-    assert B.shape[1] == d, f"B's second dimension must be d={d}, but is {B.shape[1]}"
 
-    
     if rho is None:
         def gaussian_rho(x):
-            # x has shape [..., d]
-            # Standard multivariate normal density
-            norm_sq = jnp.sum(x**2, axis=-1)
+            norm_sq = jnp.sum(x ** 2, axis=-1)
             return jnp.exp(-0.5 * norm_sq) / jnp.power(2 * jnp.pi, d / 2.0)
         rho = gaussian_rho
 
-    # Reshape for broadcasting
-    # X: [n, d] -> [n, 1, d]
-    # B: [k, d] -> [1, k, d]
-    X_reshaped = X[:, jnp.newaxis, :]
-    B_reshaped = B[jnp.newaxis, :, :]
+    X_minus_B = X[:, jnp.newaxis, :] - B[jnp.newaxis, :, :]   # [n, k, d]
 
-    # X_minus_B will have shape [n, k, d]
-    X_minus_B = X_reshaped - B_reshaped
+    if diag:
+        # A_or_a: [k, d] — stored as log(scale) for unconstrained optimisation
+        a = jnp.exp(A_or_a)                                      # [k, d], positive
+        A_inv_X_minus_B = X_minus_B / a[jnp.newaxis, :, :]      # [n, k, d]
+        inv_det_A = 1.0 / jnp.prod(a, axis=-1)                   # [k]
+    else:
+        X_minus_B_col = X_minus_B[..., jnp.newaxis]              # [n, k, d, 1]
+        A_inv_X_minus_B = jnp.squeeze(
+            solve(A_or_a, X_minus_B_col), axis=-1                 # [n, k, d]
+        )
+        det_A = jnp.linalg.det(A_or_a)                           # [k]
+        inv_det_A = jnp.where(jnp.abs(det_A) > eps, 1.0 / det_A, 0.0)
 
-    # We want to compute A_inv @ (X - B) for each n and k.
-    # A has shape [k, d, d]. X_minus_B has shape [n, k, d].
-    # We need to solve k systems of linear equations for each of the n data points.
-    # jax.linalg.solve(a, b) can broadcast over leading dimensions.
-    # Let's make 'a' be A of shape [k, d, d] and 'b' be X_minus_B of shape [n, k, d].
-    # To use solve, we need b to be of shape [..., M, K]
-    # Our A is [k, d, d]. Our X_minus_B is [n, k, d]. We want output [n, k, d].
-    # Let's make b have shape [n, k, d, 1].
-    X_minus_B_for_solve = X_minus_B[..., jnp.newaxis] # Shape: [n, k, d, 1]
-    # A is [k, d, d]. It will be broadcast to [n, k, d, d]
-    A_inv_X_minus_B_solved = solve(A, X_minus_B_for_solve) # Shape: [n, k, d, 1]
-    A_inv_X_minus_B = jnp.squeeze(A_inv_X_minus_B_solved, axis=-1) # Shape: [n, k, d]
-
-    # rho_input is A_inv_X_minus_B, shape [n, k, d]
-    # rho_output will have shape [n, k]
-    rho_vals = rho(A_inv_X_minus_B)
-
-    # det_A will have shape [k]
-    det_A = jnp.linalg.det(A)
-
-    # We need to handle the case where det(A) is close to zero.
-    # The docstring says det(A)^(-1), let's use it.
-    # Using jnp.where to avoid division by zero or very small numbers.
-    inv_det_A = jnp.where(jnp.abs(det_A) > eps, 1.0 / det_A, 0.0)
-
-    # inv_det_A has shape [k]. rho_vals has shape [n, k].
-    # Broadcasting will make this [n, k]
-    rho_transformed = inv_det_A * rho_vals
-
-    # V has shape [k, p]. rho_transformed has shape [n, k].
-    # We want Y of shape [n, p].
-    # Y[i,:] = sum_{j=1...k} V[j,:] * rho_transformed[i,j]
-    # This is a matrix multiplication: rho_transformed @ V
-    Y = jnp.dot(rho_transformed, V)
-
-    return Y
+    rho_vals = rho(A_inv_X_minus_B)                              # [n, k]
+    rho_transformed = inv_det_A * rho_vals                       # [n, k]
+    return jnp.dot(rho_transformed, V)                           # [n, p]
 
 @partial(jax.jit, static_argnums=(3,))
 def eval_splat_grad(splatnn, X, Y, variation, rho=None, eps=1e-9, sgd=False):
