@@ -198,10 +198,10 @@ def log_run(r):
         })
 
 
-print("\nLogging to MLflow …")
-for d in CONFIGS:
-    log_run(results[d])
-    print(f"  d={d} logged")
+# print("\nLogging to MLflow …")
+# for d in CONFIGS:
+#     log_run(results[d])
+#     print(f"  d={d} logged")
 
 
 # ---------------------------------------------------------------------------
@@ -214,9 +214,9 @@ levels = jnp.linspace(0.10, 1.30, 13)
 extent = [-1, 1, -1, 1]
 VMIN, VMAX = 0.0, 1.5
 
-fig = plt.figure(figsize=(20, 9))
-gs  = GridSpec(2, 4, figure=fig, hspace=0.42, wspace=0.28,
-               width_ratios=[1, 1, 1, 1.2])
+fig = plt.figure(figsize=(14, 9))
+gs  = GridSpec(2, 2, figure=fig, hspace=0.42, wspace=0.28,
+               width_ratios=[1, 1])
 
 for row, d in enumerate([4, 5]):
     r    = results[d]
@@ -252,28 +252,28 @@ for row, d in enumerate([4, 5]):
     ax_p.set_xlabel(r"$x_1$"); ax_p.set_ylabel(r"$x_2$")
     fig.colorbar(im2, ax=ax_p, label="u(x)")
 
-    # --- absolute error ---
-    ax_e = fig.add_subplot(gs[row, 2])
-    err = jnp.abs(u_s - u_tr)
-    im3 = ax_e.imshow(err, origin="lower", extent=extent, cmap="hot", vmin=0)
-    ax_e.set_title(
-        f"|error|  max={float(jnp.max(err)):.2e}\n"
-        f"(baseline MSE was {base['slice_mse']:.2e})",
-        fontsize=8,
-    )
-    ax_e.set_xlabel(r"$x_1$"); ax_e.set_ylabel(r"$x_2$")
-    fig.colorbar(im3, ax=ax_e)
+    # # --- absolute error ---
+    # ax_e = fig.add_subplot(gs[row, 2])
+    # err = jnp.abs(u_s - u_tr)
+    # im3 = ax_e.imshow(err, origin="lower", extent=extent, cmap="hot", vmin=0)
+    # ax_e.set_title(
+    #     f"|error|  max={float(jnp.max(err)):.2e}\n"
+    #     f"(baseline MSE was {base['slice_mse']:.2e})",
+    #     fontsize=8,
+    # )
+    # ax_e.set_xlabel(r"$x_1$"); ax_e.set_ylabel(r"$x_2$")
+    # fig.colorbar(im3, ax=ax_e)
 
-    # --- loss history with baseline final marked ---
-    ax_l = fig.add_subplot(gs[row, 3])
-    ax_l.semilogy([h["total"] for h in hist], lw=1.5, label="total",  color="C0")
-    ax_l.semilogy([h["bc"]    for h in hist], lw=1.2, label="BC",     color="C1")
-    ax_l.semilogy([h["pde"]   for h in hist], lw=1.2, label="PDE",    color="C2")
-    ax_l.axhline(base["pde_res"], ls="--", color="C2", lw=0.9, alpha=0.7,
-                 label=f"baseline PDE={base['pde_res']:.1e}")
-    ax_l.set_xlabel("step"); ax_l.set_ylabel("loss")
-    ax_l.set_title(f"d={d}  loss history", fontsize=9)
-    ax_l.legend(fontsize=7); ax_l.grid(True, which="both", alpha=0.3)
+    # # --- loss history with baseline final marked ---
+    # ax_l = fig.add_subplot(gs[row, 3])
+    # ax_l.semilogy([h["total"] for h in hist], lw=1.5, label="total",  color="C0")
+    # ax_l.semilogy([h["bc"]    for h in hist], lw=1.2, label="BC",     color="C1")
+    # ax_l.semilogy([h["pde"]   for h in hist], lw=1.2, label="PDE",    color="C2")
+    # ax_l.axhline(base["pde_res"], ls="--", color="C2", lw=0.9, alpha=0.7,
+    #              label=f"baseline PDE={base['pde_res']:.1e}")
+    # ax_l.set_xlabel("step"); ax_l.set_ylabel("loss")
+    # ax_l.set_title(f"d={d}  loss history", fontsize=9)
+    # ax_l.legend(fontsize=7); ax_l.grid(True, which="both", alpha=0.3)
 
 
 # Summary suptitle
@@ -298,15 +298,15 @@ print(f"\nSaved {out}")
 # Log figure to summary run
 with mlflow.start_run(run_name="eikonal-srm-hd-boost-summary"):
     mlflow.log_params({"dims": "[4,5]", "run_type": "boost_summary"})
-    for d in [4, 5]:
-        r, b = results[d], BASELINE[d]
-        mlflow.log_metrics({
-            f"d{d}/slice_mse_boost":    r["slice_mse"],
-            f"d{d}/pde_res_boost":      r["pde_res"],
-            f"d{d}/slice_mse_baseline": b["slice_mse"],
-            f"d{d}/improvement_x":      b["slice_mse"] / r["slice_mse"],
-            f"d{d}/wall_time_s":        r["elapsed"],
-        })
+    # for d in [4, 5]:
+    #     r, b = results[d], BASELINE[d]
+    #     mlflow.log_metrics({
+    #         f"d{d}/slice_mse_boost":    r["slice_mse"],
+    #         f"d{d}/pde_res_boost":      r["pde_res"],
+    #         f"d{d}/slice_mse_baseline": b["slice_mse"],
+    #         f"d{d}/improvement_x":      b["slice_mse"] / r["slice_mse"],
+    #         f"d{d}/wall_time_s":        r["elapsed"],
+    #     })
     mlflow.log_artifact(out, artifact_path="figures")
 print("Summary run logged to MLflow.")
 
