@@ -1,14 +1,35 @@
-[tool.poetry]
+[project]
 name = "srms"
 version = "0.1.0"
-description = ""
-authors = ["Tassos Manganaris <tassos.manganaris@gmail.com>"]
+description = "Splat Regression Models for geodesic path planning"
 readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "jax>=0.4.30",
+    "numpy>=1.26",
+    "matplotlib>=3.8",
+    "optax>=0.2",
+    "flax>=0.8",
+    "jaxkan>=0.1",
+    "tqdm>=4.66",
+    "tyro>=0.8",
+]
 
-[tool.poetry.dependencies]
-python = "^3.12"
+[project.optional-dependencies]
+# On a CUDA GPU box: `uv sync --extra gpu` (Linux only; JAX then auto-uses the GPU, no code change).
+gpu = ["jax[cuda12]>=0.4.30; sys_platform == 'linux'"]
 
+[tool.uv]
+package = false
 
-[build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+[dependency-groups]
+dev = ["ruff>=0.6"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "basic"
+reportMissingModuleSource = false

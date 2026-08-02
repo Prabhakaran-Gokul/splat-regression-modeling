@@ -1,5 +1,12 @@
 __pycache__
 .DS_Store
 *.pyc
-logs/*.pkl
 mlruns/
+.venv
+.ruff_cache
+logs
+*.pkl
+*.json
+*.log
+*.png
+validation.md

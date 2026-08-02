@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Eikonal equation solver using Splat Regression Models (SRM).
 
