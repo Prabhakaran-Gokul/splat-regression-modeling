@@ -1,7 +1,8 @@
 #!/bin/zsh
+set -euo pipefail
 # B1 vanilla PINN | B2 NTFields | B3 P-NTFields (no RRT*) || B4/B5 use the SAME ~300 RRT* samples,
 # injected two ways: B4 as sparse anchors, B5 as a sparse base the PDE refines || B6 supervised.
-cd /Users/baner121/splat-regression-modeling
+cd -- "${0:A:h}"
 source .venv/bin/activate 2>/dev/null || true
 mkdir -p figures/baselines/{B1,B2,B3,B4,B5,B6}
 
