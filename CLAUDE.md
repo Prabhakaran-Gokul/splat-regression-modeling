@@ -13,6 +13,50 @@ f(x) = Σ_j V[j] · ρ_{A[j], B[j]}(x)
 
 Parameters `(V, A, B)` represent weights `[k, p]`, scale/rotation matrices `[k, d, d]`, and centers `[k, d]`. The default mother function `ρ` is the standard multivariate Gaussian. The framework compares SRM against MLPs and KANs on regression and physics-informed learning tasks.
 
+## Current focus: Eikonal motion planning with splats (torus / robot arm)
+
+The active line of work applies SRM to **optimal motion planning as an Eikonal value function**
+`T(θ)` (time-to-go), whose optimal paths are `−∇T`. Target: a 2-joint arm's configuration space is
+the **2-torus**; obstacles are a smooth **slowness field** (high cost near collision). Read
+[`theory.md`](theory.md) (why + method derivation, §9), [`investigation.md`](investigation.md)
+(running log + **Executive summary** at top), and [`validation_highd.md`](validation_highd.md)
+(certifying a learned field without ground truth).
+
+**Files (this line of work):**
+- `torus.py` — **main file.** Self-supervised Eikonal on the 2-torus with obstacles. Splats placed
+  *intrinsically* (angle space, wrapped log-map `wrap(θ−B)`), metric kept separate via
+  `metric_inv(θ)` (identity now, `M(θ)⁻¹` for the arm). Methods (`--method`): `eikonal`
+  (`base·(1+g)` + residual²), `ntfields` (`base/τ` + symmetric speed-match loss + causal +
+  progressive + optional RRT* anchors), `roadmap` (RRT* soft-min base + Eikonal refinement, optional
+  anchors), `supervised` (oracle: fit to FMM), `screened` (Hopf–Cole; explored, not used). FMM
+  (`fast_marching_torus`) is the 2D ground truth only.
+- `ground_truth.py` — `PlanningProblem` (plane/sphere), analytic + FMM ground truth, `draw_field`.
+- `train.py` — supervised splat fit to a known field (plane/sphere milestone).
+- `self_supervised.py` — plane-with-obstacles self-supervised Eikonal + feasibility-guarded path
+  extraction (`extract_path`, collision-checked descent — the collision *guarantee*).
+- `scenes.py` — SDF obstacle primitives (circle/box, unions), smooth slowness, surface samples.
+- `diagnose.py` — near-obstacle zoom (τ field, `‖∇T‖/s` ratio, splat centres).
+- `run_baselines.sh` — the fair baseline suite (B1..B6). `refine_experiment.py` /
+  `thinning_experiment.py` — the RRT*-prior refinement and sparsity-scaling studies.
+
+**Key findings (see investigation.md Executive summary for numbers):** the splat *representation* is
+not the bottleneck (oracle ≈ 0.003); pure physics-informed under-determines the level behind
+obstacles (~0.31); a **rough mesh-free RRT\* prior that the Eikonal refines** is the win (0.11 at ~300
+samples) and *beats trusting the planner's values as anchors* (which is worse than no supervision,
+because RRT* costs are suboptimal). Refinement degrades gracefully but not immunely as samples thin
+(`~nodes^-0.67`). Retired: dense-RRT* base (cheating), screened-Poisson, antipodal sampling.
+
+**Run examples:**
+```bash
+python torus.py --method roadmap --base_reg 3 --rrt_iters 350 --roadmap_gamma 0.01   # prior + refine
+python torus.py --method ntfields --causal                                            # planner-free (P-NTFields-like)
+python torus.py --method supervised                                                   # oracle (representation ceiling)
+zsh run_baselines.sh                                                                   # full fair suite → figures/baselines/
+```
+
+**Next (planned):** fixed-budget dimension sweep (2→3→4-D, the true scaling test), then the
+**anisotropic metric** (`metric_inv → M(θ)⁻¹`) + joint limits toward the 12-DOF arm goal.
+
 ## Stack
 
 - **JAX** for all numerics and autodiff
@@ -23,65 +67,22 @@ Parameters `(V, A, B)` represent weights `[k, p]`, scale/rotation matrices `[k, 
 
 ## Running scripts
 
-There is no build system or test runner. Scripts are executed directly:
+There is no build system or test runner; scripts are executed directly. For the **current
+motion-planning line**, see the run examples in "Current focus" above (`python torus.py --method …`,
+`zsh run_baselines.sh`).
 
-```bash
-# Run the main regression comparison (trains SRM vs KAN vs MLP)
-python regression_comparison.py --seed 42 --name experiment1
+The original SRM **regression / KAN comparison and physics-informed exploration** scripts
+(`regression_comparison.py`, `physinf_comparison.py`, `dubins_*.py`, `sphere_*.py`, `eikonal_*.py`,
+etc.) predate this line and have been **moved to `_archive/preexisting/`** — they are kept for
+reference but are not part of the active codebase. Restore any by moving it back to the top level.
 
-# Load and plot a saved snapshot
-python regression_comparison.py --load logs/regression_*.pkl
+### Core splat library: `lib/splat.py` (still used)
 
-# Run physics-informed comparison
-python physinf_comparison.py --mode example
-
-# Run CGLS (Complex Ginzburg-Landau) experiment
-python physinf_comparison.py --mode cgls
-
-# Run the splat demo (1D and 2D animations, saves .gif/.mp4)
-python lib/splat.py
-
-# Test GPU availability
-python simple_gpu_test.py
-```
-
-Results are saved as `.pkl` snapshots in `logs/` and figures as `.png`/`.pdf`.
-
-## Architecture
-
-### Core model: `lib/splat.py`
-
-- `eval_splat(X, splatnn, rho=None)` — forward pass; `splatnn = (V, A, B)`; `@jax.jit`
-- `eval_splat_grad(splatnn, X, Y, variation, ...)` — analytic gradient of the MSE loss w.r.t. `(V, A, B)` using the custom derivation from the paper; does **not** use `jax.grad` (implements the score function estimator)
-- `gd_splat_regression(init_splat, train_X, train_Y, ...)` — training loop returning a list of `(V, A, B)` at each step; supports Adam via optax
-- `splat_anim_1d` / `splat_anim_2d` — matplotlib animation helpers for notebooks
-
-### Comparison models: `lib/nets.py`
-
-- `gd_net_regression(model, ...)` — trains any `nnx.Module` (MLP or KAN) with the same interface
-
-### Experiment infrastructure: `regression_comparison.py`, `physinf_comparison.py`
-
-- `run_regression_comparison(...)` / `run_pinn_comparison(...)` — orchestrate multi-architecture experiments
-- Results are serialized with `pickle` and can be reloaded for plotting without retraining
-- `physinf_comparison.py` defines `PDEProblem` subclasses: `PoissonProblem`, `AdvectionDiffusionProblem`, `AllenCahnProblem`, `BurgersProblem`, `ComplexGinzbergLandauProblem`
-- PINN loss = boundary loss + `physics_weight` × PDE residual MSE; gradients computed via `jax.grad`/`jax.hessian`
-
-### Known missing code
-
-- `physinf_comparison.py` imports `from v2.lib.splat import ...` and `cgls_solver` — these modules are not present in this directory; `lib/splat.py` is the current version to use
-- `lib/test_identification.py` also references `v2.lib.nets`
-
-## Physics-Informed Use (Eikonal)
-
-The Eikonal equation constraint is `|∇u(x)| = 1/c(x)` where `c(x)` is the speed field. The canonical approach in this codebase is:
-
-1. Define a `PDEProblem`-style class with `pde_residual` encoding `|∇u(x)|² − 1/c(x)² = 0`
-2. Compute `∇u` via `jax.grad(lambda x_single: eval_splat(x_single[None,:], params)[0,0])`
-3. Use `jax.value_and_grad(loss_fn)(curr_splat)` to differentiate the PINN loss through `eval_splat` w.r.t. `(V, A, B)` — this is the **autodiff path**, not `eval_splat_grad` which is specific to least-squares regression
-4. Update with `optax.adam` as shown in `train_and_evaluate_splat_pinn`
-
-The `compute_pinn_loss` and `compute_derivatives` functions in `physinf_comparison.py` are the reference implementation for wiring up derivative constraints.
+- `eval_splat(X, splatnn, rho=None)` — forward pass; `splatnn = (V, A, B)`; `@jax.jit`. Imported by
+  `train.py`/`self_supervised.py` (the plane/sphere milestones). `torus.py` uses its own periodic
+  `eval_splat_torus`.
+- `eval_splat_grad`, `gd_splat_regression`, `splat_anim_1d/2d` — analytic-gradient regression and demo
+  helpers from the original framework.
 
 ## Data conventions
 
