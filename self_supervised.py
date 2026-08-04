@@ -36,7 +36,7 @@ from tqdm import trange
 
 import scenes
 from ground_truth import PlanningProblem, draw_field, make_plane, make_plane_scene
-from lib.splat import eval_splat
+from srms.lib.splat import eval_splat
 from scenes import Scene
 from train import init_splat, render_comparison
 

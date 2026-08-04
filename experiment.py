@@ -19,7 +19,7 @@ import numpy as np
 import tyro
 
 from ground_truth import Circle, make_plane_fmm
-from lib.splat import eval_splat
+from srms.lib.splat import eval_splat
 from train import fit_splat, init_splat, render_comparison
 
 
