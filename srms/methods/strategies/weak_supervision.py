@@ -17,7 +17,8 @@ training loop work for any of them.
 Training loop is the same "simplest, dumbest" style as ``eikonal.py``: plain
 fresh random collocation each step, a symmetric speed-match residual against
 the base plus a small regularizer keeping the correction small, no adaptive
-sampling/causal weighting/anchors.
+sampling/anchors — optional causal weighting on the residual term is available
+(``cfg.causal``, see ``training_aids.py``).
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ import optax
 from tqdm import trange
 
 from srms.environments import sampling
+from srms.methods.strategies import training_aids
 
 
 def roadmap_base(theta: jnp.ndarray, nodes: jnp.ndarray, costs: jnp.ndarray, gamma: float, env, ksamp: int) -> jnp.ndarray:
@@ -98,24 +100,24 @@ def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
     rng = np.random.default_rng(cfg.seed)
 
     # roadmap_residual's q + 1/q - 2 has a genuine 1/q singularity as q -> 0 (unlike eikonal.py's bounded
-    # residual); unlike torus.py's fuller solve_roadmap, this strategy has no causal weighting or
-    # obstacle-band gating to damp collocation points that wander near it, so a stray step can blow the
-    # gradient up and NaN the run (observed in practice with the srm backend). Clip, as this repo's own
-    # archived PINN scripts (dubins_eikonal.py, sphere_eikonal.py, dubins_se2_pinn.py) do for this exact
-    # loss family.
+    # residual); this strategy has no obstacle-band gating to damp collocation points that wander near
+    # it, so a stray step can blow the gradient up and NaN the run (observed in practice with the srm
+    # backend, even with causal weighting on). Clip, as this repo's own archived PINN scripts
+    # (dubins_eikonal.py, sphere_eikonal.py, dubins_se2_pinn.py) do for this exact loss family.
     optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(cfg.lr))
     opt_state = optimizer.init(params)
 
-    def loss_fn(p, colloc, slow):
+    def loss_fn(p, colloc, slow, rate):
         residual = roadmap_residual(backend, p, colloc, slow, nodes, costs, cfg.roadmap_gamma, env, cfg.roadmap_hop)
         correction = backend.eval_raw(p, colloc, env).ravel()
-        residual_loss = jnp.mean(residual**2)
+        squared = residual**2
+        residual_loss = training_aids.causal_loss(env, colloc, squared, rate) if cfg.causal else jnp.mean(squared)
         reg_loss = cfg.base_reg * jnp.mean(correction**2)
         return residual_loss + reg_loss, {"residual": residual_loss, "reg": reg_loss}
 
     @jax.jit
-    def step(p, state, colloc, slow):
-        (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(p, colloc, slow)
+    def step(p, state, colloc, slow, rate):
+        (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(p, colloc, slow, rate)
         updates, state = optimizer.update(grads, state, p)
         return optax.apply_updates(p, updates), state, loss, aux
 
@@ -123,7 +125,8 @@ def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
     for i in progress:
         colloc = jnp.asarray(env.sample_domain(rng, cfg.num_collocation), dtype=jnp.float32)
         slow = env.slowness(colloc)
-        params, opt_state, loss, aux = step(params, opt_state, colloc, slow)
+        rate = jnp.float32(training_aids.causal_rate(cfg, i)) if cfg.causal else jnp.float32(0.0)
+        params, opt_state, loss, aux = step(params, opt_state, colloc, slow, rate)
         if i % cfg.log_every == 0:
             progress.set_description(f"weak_supervision — log10(loss) = {float(jnp.log10(loss + 1e-12)):.3f}")
             if progress_fn is not None:

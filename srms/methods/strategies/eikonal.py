@@ -10,7 +10,8 @@ Eikonal PDE ``‖∇T‖ = 1/s`` is enforced on random collocation points exclud
 that same ball. This mirrors ``_archive/preexisting/eikonal_splat.py``'s
 ``eikonal_loss``/``train_eikonal_splat`` (and the dynamic per-step resampling
 of ``eikonal_nd_dynamic.py``) as closely as possible: no adaptive sampling,
-causal weighting, obstacle-shadow anchors, or factored base — just BC + PDE loss.
+obstacle-shadow anchors, or factored base — just BC + PDE loss, plus optional
+causal weighting on the PDE term (``cfg.causal``, see ``training_aids.py``).
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from tqdm import trange
+
+from srms.methods.strategies import training_aids
 
 
 def predict(backend, params, thetas: jnp.ndarray, env) -> jnp.ndarray:
@@ -69,14 +72,15 @@ def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
     optimizer = optax.adam(cfg.lr)
     opt_state = optimizer.init(params)
 
-    def loss_fn(p, colloc, slow):
+    def loss_fn(p, colloc, slow, rate):
         bc = jnp.mean((predict(backend, p, src_pts, env) - src_vals) ** 2)
-        pde = jnp.mean(pde_residual(backend, p, colloc, slow, env) ** 2)
+        squared = pde_residual(backend, p, colloc, slow, env) ** 2
+        pde = training_aids.causal_loss(env, colloc, squared, rate) if cfg.causal else jnp.mean(squared)
         return bc + cfg.physics_weight * pde, {"bc": bc, "pde": pde}
 
     @jax.jit
-    def step(p, state, colloc, slow):
-        (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(p, colloc, slow)
+    def step(p, state, colloc, slow, rate):
+        (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(p, colloc, slow, rate)
         updates, state = optimizer.update(grads, state, p)
         return optax.apply_updates(p, updates), state, loss, aux
 
@@ -84,7 +88,8 @@ def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
     for i in progress:
         colloc = sample_collocation(env, rng, cfg.num_collocation, cfg.source_radius)
         slow = env.slowness(colloc)
-        params, opt_state, loss, aux = step(params, opt_state, colloc, slow)
+        rate = jnp.float32(training_aids.causal_rate(cfg, i)) if cfg.causal else jnp.float32(0.0)
+        params, opt_state, loss, aux = step(params, opt_state, colloc, slow, rate)
         if i % cfg.log_every == 0:
             progress.set_description(f"eikonal — log10(loss) = {float(jnp.log10(loss + 1e-12)):.3f}")
             if progress_fn is not None:

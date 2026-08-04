@@ -48,6 +48,12 @@ class Config:
             count and inclusive (min, max) angular radius of the obstacles; slowness_max /
             slow_width: peak slowness inside obstacles and the ramp width (rad).
 
+        Causal weighting (all strategies) — causal: weight each strategy's residual term
+            source-outward, so a far collocation point is only trusted once nearer points are
+            already well-fit (Wang et al. 2022; ``training_aids.py``); causal_strength: base decay
+            rate scale (divided by num_collocation); causal_anneal: relax the rate to 0 by the end
+            of training.
+
         Eikonal strategy — source_radius: BC-ring geodesic radius / PDE collocation exclusion
             radius around the source; n_sphere: number of BC points on that ring; physics_weight:
             weight on the PDE loss term relative to the boundary-condition loss.
@@ -79,6 +85,10 @@ class Config:
     obstacle_radius: tuple[float, float] = (0.5, 0.9)
     slowness_max: float = 10.0
     slow_width: float = 0.15
+    # causal weighting (all strategies)
+    causal: bool = True
+    causal_strength: float = 5.0
+    causal_anneal: bool = True
     # eikonal strategy
     source_radius: float = 0.25
     n_sphere: int = 32

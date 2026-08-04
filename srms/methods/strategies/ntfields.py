@@ -13,7 +13,8 @@ here to test the literal paper form first. ``T(start)=0`` automatically since ``
 Trained with the same symmetric speed-match residual ``q + 1/q − 2`` as
 ``weak_supervision.py``'s roadmap field — both strategies are of the form
 ``T = base(θ) · factor(correction(θ))``; only the base (analytic geodesic here vs. RRT* roadmap
-there) and factor (``1/τ`` here vs. ``exp(g)`` there) differ.
+there) and factor (``1/τ`` here vs. ``exp(g)`` there) differ. Optional causal weighting on the
+residual term is available (``cfg.causal``, see ``training_aids.py``).
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ import numpy as np
 import optax
 from tqdm import trange
 
+from srms.methods.strategies import training_aids
 from srms.methods.strategies.eikonal import sample_collocation
 
 
@@ -68,20 +70,22 @@ def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
     params = backend.init_params(jax.random.PRNGKey(cfg.seed), env, cfg)
     rng = np.random.default_rng(cfg.seed)
 
-    # Same q + 1/q - 2 singularity as weak_supervision.py's roadmap_residual, here with no causal
-    # weighting or obstacle-band gating to damp it (and, at tau_min=0, an unfloored 1/tau that can
-    # itself blow up) — clip proactively rather than waiting to rediscover the NaN.
+    # Same q + 1/q - 2 singularity as weak_supervision.py's roadmap_residual, here with no obstacle-band
+    # gating to damp it (and, at tau_min=0, an unfloored 1/tau that can itself blow up) — clip
+    # proactively rather than waiting to rediscover the NaN. Causal weighting (below) helps but, per the
+    # sphere+srm NaN seen with tau_min=0, cannot rescue a gradient that has already gone NaN.
     optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(cfg.lr))
     opt_state = optimizer.init(params)
 
-    def loss_fn(p, colloc, slow):
+    def loss_fn(p, colloc, slow, rate):
         residual = ntfields_residual(backend, p, colloc, slow, env, cfg.tau_bias, cfg.tau_min)
-        residual_loss = jnp.mean(residual**2)
+        squared = residual**2
+        residual_loss = training_aids.causal_loss(env, colloc, squared, rate) if cfg.causal else jnp.mean(squared)
         return residual_loss, {"residual": residual_loss}
 
     @jax.jit
-    def step(p, state, colloc, slow):
-        (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(p, colloc, slow)
+    def step(p, state, colloc, slow, rate):
+        (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(p, colloc, slow, rate)
         updates, state = optimizer.update(grads, state, p)
         return optax.apply_updates(p, updates), state, loss, aux
 
@@ -89,7 +93,8 @@ def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
     for i in progress:
         colloc = sample_collocation(env, rng, cfg.num_collocation, cfg.source_radius)
         slow = env.slowness(colloc)
-        params, opt_state, loss, aux = step(params, opt_state, colloc, slow)
+        rate = jnp.float32(training_aids.causal_rate(cfg, i)) if cfg.causal else jnp.float32(0.0)
+        params, opt_state, loss, aux = step(params, opt_state, colloc, slow, rate)
         if i % cfg.log_every == 0:
             progress.set_description(f"ntfields — log10(loss) = {float(jnp.log10(loss + 1e-12)):.3f}")
             if progress_fn is not None:
