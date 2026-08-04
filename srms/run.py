@@ -19,10 +19,10 @@ import tyro
 
 from srms.environments import ENVIRONMENTS, sampling
 from srms.methods.backends import BACKENDS
-from srms.methods.strategies import eikonal, weak_supervision
+from srms.methods.strategies import eikonal, ntfields, weak_supervision
 from srms.viz import render
 
-STRATEGIES = {"eikonal": eikonal, "weak_supervision": weak_supervision}
+STRATEGIES = {"eikonal": eikonal, "weak_supervision": weak_supervision, "ntfields": ntfields}
 
 
 @dataclasses.dataclass
@@ -36,8 +36,9 @@ class Config:
             works at any dim; the dense-grid ground truth (fast marching) and rendering only make
             sense at dim=2 (a dense grid is intractable and unplottable beyond that) and are skipped
             for dim>2 — only the final training loss is reported.
-        method: ``eikonal`` (free field, BC ring + PDE residual loss) or
-            ``weak_supervision`` (RRT* soft-min base × exp(correction) refinement).
+        method: ``eikonal`` (free field, BC ring + PDE residual loss),
+            ``weak_supervision`` (RRT* soft-min base × exp(correction) refinement), or
+            ``ntfields`` (analytic-geodesic base / network-predicted speed τ).
         backend: the function-approximator backend the strategy trains (see
             ``srms/methods/backends``) — ``srm`` (splat mixture) or ``mlp`` (SIREN-style
             periodic-activation MLP).
@@ -56,6 +57,10 @@ class Config:
             temperature; roadmap_hop: samples along each last hop for its slowness weighting;
             base_reg: pull of the splat correction toward zero (small ⇒ physics leads).
 
+        NTFields strategy — tau_bias: initial sigmoid bias so τ starts near 1 (free space) at
+            init; tau_min: floor of τ = τ_min + (1−τ_min)·σ(g+bias) (0 ⇒ the un-floored paper
+            formulation; >0 is an ablation against the τ→0 runaway).
+
         MLP backend — mlp_width: hidden layer width; mlp_depth: number of hidden layers;
             mlp_omega0: SIREN frequency scale for the hidden-layer init (Sitzmann et al.).
 
@@ -66,7 +71,7 @@ class Config:
 
     environment: Literal["torus", "sphere"] = "torus"
     dim: int = 2
-    method: Literal["eikonal", "weak_supervision"] = "eikonal"
+    method: Literal["eikonal", "weak_supervision", "ntfields"] = "eikonal"
     backend: Literal["srm", "mlp"] = "srm"
     # scene
     start: tuple[float, ...] | None = None
@@ -86,6 +91,9 @@ class Config:
     roadmap_gamma: float = 0.05
     roadmap_hop: int = 5
     base_reg: float = 1.0
+    # ntfields strategy
+    tau_bias: float = 4.0
+    tau_min: float = 0.0
     # mlp backend
     mlp_width: int = 128
     mlp_depth: int = 3
@@ -153,6 +161,8 @@ def main(cfg: Config) -> None:
             return np.asarray(
                 weak_supervision.predict(backend, current, thetas, nodes, costs, cfg.roadmap_gamma, env, cfg.roadmap_hop)
             )
+        if cfg.method == "ntfields":
+            return np.asarray(ntfields.predict(backend, current, thetas, env, cfg.tau_bias, cfg.tau_min))
         return np.asarray(eikonal.predict(backend, current, thetas, env))
 
     checkpoint = None
