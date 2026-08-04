@@ -1,8 +1,9 @@
-from srms.methods.backends import srm
+from srms.methods.backends import mlp, srm
 
 BACKENDS = {
     "srm": srm,
-    # "ntfields", "mlp", "kan" — not yet implemented.
+    "mlp": mlp,
+    # "ntfields", "kan" — not yet implemented.
 }
 
-__all__ = ["BACKENDS", "srm"]
+__all__ = ["BACKENDS", "srm", "mlp"]

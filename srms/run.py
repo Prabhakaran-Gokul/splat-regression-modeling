@@ -12,6 +12,7 @@ import dataclasses
 import pickle
 from typing import Literal
 
+import jax
 import numpy as np
 import tyro
 
@@ -32,7 +33,8 @@ class Config:
         method: ``eikonal`` (free field, BC ring + PDE residual loss) or
             ``weak_supervision`` (RRT* soft-min base × exp(correction) refinement).
         backend: the function-approximator backend the strategy trains (see
-            ``srms/methods/backends``); currently only ``srm`` is implemented.
+            ``srms/methods/backends``) — ``srm`` (splat mixture) or ``mlp`` (SIREN-style
+            periodic-activation MLP).
 
         Scene — start: source joint angles (rad); num_obstacles / obstacle_radius: count and
             inclusive (min, max) radius of the circular angle-space obstacles; slowness_max /
@@ -47,12 +49,15 @@ class Config:
             temperature; roadmap_hop: samples along each last hop for its slowness weighting;
             base_reg: pull of the splat correction toward zero (small ⇒ physics leads).
 
+        MLP backend — mlp_width: hidden layer width; mlp_depth: number of hidden layers;
+            mlp_omega0: SIREN frequency scale for the hidden-layer init (Sitzmann et al.).
+
         Training / output — num_splats, num_collocation, steps, lr, init_scale, resolution
             (eval + FMM grid), seed, error_clip (error colour limit), checkpoint_every, out_dir.
     """
 
     method: Literal["eikonal", "weak_supervision"] = "eikonal"
-    backend: Literal["srm"] = "srm"
+    backend: Literal["srm", "mlp"] = "srm"
     # scene
     start: tuple[float, float] = (-1.5, -1.5)
     num_obstacles: int = 3
@@ -71,6 +76,10 @@ class Config:
     roadmap_gamma: float = 0.05
     roadmap_hop: int = 5
     base_reg: float = 1.0
+    # mlp backend
+    mlp_width: int = 128
+    mlp_depth: int = 3
+    mlp_omega0: float = 30.0
     # training / output
     num_splats: int = 384
     num_collocation: int = 2048
@@ -123,7 +132,12 @@ def main(cfg: Config) -> None:
     metrics = render(env, cfg, gt, prediction, inside, shape)
     with open(f"{cfg.out_dir}/splat.pkl", "wb") as f:  # save params + scene for the near-obstacle diagnostic
         pickle.dump(
-            {"splat": [np.asarray(a) for a in splat], "obstacles": env.obstacles, "cfg": dataclasses.asdict(cfg)}, f
+            {
+                "splat": jax.tree_util.tree_map(np.asarray, splat),
+                "obstacles": env.obstacles,
+                "cfg": dataclasses.asdict(cfg),
+            },
+            f,
         )
     print(f"saved {cfg.out_dir}/torus_obstacles.png  ({len(env.obstacles)} obstacles)")
     print(f"RMS={metrics['rms']:.4e}  max|err|={metrics['max_abs']:.4e}  rel_RMS={metrics['rel_rms']:.4e}")
