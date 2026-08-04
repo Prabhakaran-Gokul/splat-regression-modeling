@@ -97,7 +97,13 @@ def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
     )
     rng = np.random.default_rng(cfg.seed)
 
-    optimizer = optax.adam(cfg.lr)
+    # roadmap_residual's q + 1/q - 2 has a genuine 1/q singularity as q -> 0 (unlike eikonal.py's bounded
+    # residual); unlike torus.py's fuller solve_roadmap, this strategy has no causal weighting or
+    # obstacle-band gating to damp collocation points that wander near it, so a stray step can blow the
+    # gradient up and NaN the run (observed in practice with the srm backend). Clip, as this repo's own
+    # archived PINN scripts (dubins_eikonal.py, sphere_eikonal.py, dubins_se2_pinn.py) do for this exact
+    # loss family.
+    optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(cfg.lr))
     opt_state = optimizer.init(params)
 
     def loss_fn(p, colloc, slow):

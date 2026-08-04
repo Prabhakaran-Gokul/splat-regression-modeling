@@ -166,6 +166,16 @@ def main(cfg: Config) -> None:
 
     run_name = f"{cfg.environment}-{cfg.method}-{cfg.backend}-d{cfg.dim}"
     with mlflow.start_run(run_name=run_name):
+        mlflow.set_tags(
+            {
+                "environment": cfg.environment,
+                "method": cfg.method,
+                "backend": cfg.backend,
+                "dim": str(cfg.dim),
+                # same for the srm/mlp pair of a scene -> group by this tag to compare backends head-to-head
+                "comparison_group": f"{cfg.environment}-{cfg.method}-d{cfg.dim}",
+            }
+        )
         mlflow.log_params(dataclasses.asdict(cfg))
 
         def progress_fn(step: int, metrics: dict) -> None:
