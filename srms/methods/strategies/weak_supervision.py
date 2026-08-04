@@ -32,8 +32,13 @@ from srms.environments import sampling
 
 
 def roadmap_base(theta: jnp.ndarray, nodes: jnp.ndarray, costs: jnp.ndarray, gamma: float, env, ksamp: int) -> jnp.ndarray:
-    """Obstacle-aware cost-to-come: soft-min_i (cost_i + slowness-weighted ‖hop from node_i to θ‖)."""
-    disp = env.log_map(nodes, theta[None, :])  # [N, dim]
+    """Obstacle-aware cost-to-come: soft-min_i (cost_i + slowness-weighted ‖hop from node_i to θ‖).
+
+    Uses log_map_ambient (not log_map) since the hop below needs an *ambient* tangent vector it can
+    add to `nodes` and then re-project with wrap_point — on a flat chart the two coincide, but not on
+    an embedded manifold like the sphere.
+    """
+    disp = jax.vmap(lambda mu: env.log_map_ambient(mu, theta))(nodes)  # [N, dim]
     ts = jnp.linspace(0.0, 1.0, ksamp)
     seg = nodes[None, :, :] + ts[:, None, None] * disp[None, :, :]  # [K, N, dim] points along each last hop
     mean_slow = env.slowness(env.wrap_point(seg.reshape(-1, env.dim))).reshape(ksamp, -1).mean(0)  # [N]
@@ -74,7 +79,9 @@ def roadmap_residual(
         return field_roadmap(backend, params, x, nodes, costs, gamma, env, ksamp)
 
     grad = jax.vmap(jax.grad(t_single))(thetas)
-    q = jnp.sqrt(jnp.sum(grad**2, axis=-1) + 1e-12) / slow
+    metric = jax.vmap(env.metric_inv)(thetas)
+    grad_sq = jnp.einsum("ni,nij,nj->n", grad, metric, grad)
+    q = jnp.sqrt(grad_sq + 1e-12) / slow
     return q + 1.0 / q - 2.0
 
 

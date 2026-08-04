@@ -28,11 +28,9 @@ def predict(backend, params, thetas: jnp.ndarray, env) -> jnp.ndarray:
 
 
 def source_sphere(env, eps: float, n_pts: int, seed: int) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """``n_pts`` points on a sphere of radius ``eps`` around the source, with the known local travel time."""
+    """``n_pts`` points at geodesic distance ``eps`` from the source, with the known local travel time."""
     rng = np.random.default_rng(seed)
-    z = rng.standard_normal((n_pts, env.dim)).astype(np.float64)
-    z /= np.linalg.norm(z, axis=-1, keepdims=True) + 1e-12
-    points = env.wrap_point_np(np.asarray(env.start) + eps * z)
+    points = env.boundary_ring_np(rng, eps, n_pts)
     value = eps * float(env.slowness_np(np.asarray(env.start)[None, :])[0])
     return jnp.asarray(points, dtype=jnp.float32), jnp.full(n_pts, value, dtype=jnp.float32)
 
@@ -45,13 +43,16 @@ def sample_collocation(env, rng: np.random.Generator, n: int, exclude_radius: fl
 
 
 def pde_residual(backend, params, thetas: jnp.ndarray, slow: jnp.ndarray, env) -> jnp.ndarray:
-    """Eikonal residual ``‖∇T‖ − 1/slow`` at each θ."""
+    """Eikonal residual ``‖∇T‖_g − 1/slow`` at each θ, ‖·‖_g via env.metric_inv (identity on a flat
+    chart; a tangent-plane projector on an embedded manifold like the sphere)."""
 
     def u_single(x):
         return backend.eval_raw(params, x[None, :], env)[0, 0]
 
     grad = jax.vmap(jax.grad(u_single))(thetas)
-    grad_norm = jnp.sqrt(jnp.sum(grad**2, axis=-1) + 1e-12)
+    metric = jax.vmap(env.metric_inv)(thetas)
+    grad_sq = jnp.einsum("ni,nij,nj->n", grad, metric, grad)
+    grad_norm = jnp.sqrt(grad_sq + 1e-12)
     return grad_norm - 1.0 / slow
 
 

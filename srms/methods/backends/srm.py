@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from srms.lib.manifold_splat import eval_wrapped_gaussian
 
@@ -31,10 +32,16 @@ SplatParams = tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]
 
 
 def init_params(key: jax.Array, env, cfg, p: int = 1) -> SplatParams:
-    """Initialise (V, A, B) with zero weights and centres uniform over env.domain."""
-    lo, hi = env.domain
-    centres = jax.random.uniform(key, (cfg.num_splats, env.dim), minval=lo, maxval=hi)
-    scales = jnp.repeat((cfg.init_scale * jnp.eye(env.dim))[None], cfg.num_splats, axis=0)
+    """Initialise (V, A, B) with zero weights and centres drawn from env.sample_domain.
+
+    Centres need environment-specific sampling (a box for the torus, a unit sphere for
+    SphereEnvironment), not a generic uniform box, so this delegates to the same host-side sampler
+    RRT*/collocation already use rather than assuming ``env.domain`` is a box.
+    """
+    seed = int(jax.random.randint(key, (), 0, 2**31 - 1))
+    centres_np = env.sample_domain(np.random.default_rng(seed), cfg.num_splats)
+    centres = jnp.asarray(centres_np, dtype=jnp.float32)
+    scales = jnp.repeat((cfg.init_scale * jnp.eye(env.tangent_dim))[None], cfg.num_splats, axis=0)
     return jnp.zeros((cfg.num_splats, p)), scales, centres
 
 
@@ -45,7 +52,7 @@ def eval_raw(params: SplatParams, X: jnp.ndarray, env) -> jnp.ndarray:
     def rho_at_x(x: jnp.ndarray) -> jnp.ndarray:
         return jax.vmap(
             lambda mu, Ak: eval_wrapped_gaussian(
-                x, mu, Ak, log_map_fn=env.log_map, jac_factor_fn=env.jac_factor, dim=env.dim
+                x, mu, Ak, log_map_fn=env.log_map, jac_factor_fn=env.jac_factor, dim=env.tangent_dim
             )
         )(B, A)
 

@@ -1,14 +1,17 @@
-"""Flat 2-torus T² environment with circular obstacles and a smooth slowness field.
+"""Flat n-torus Tⁿ environment with spherical obstacles and a smooth slowness field.
 
-``T²`` is the configuration space of a 2-joint revolute arm. Splats are placed
-*intrinsically* (angle space), evaluated at the wrapped log map ``wrap(θ − B)``
-so periodicity is automatic and the model dimension equals the joint count.
-The metric is kept separate (``metric_inv``: identity here, ``M(θ)⁻¹`` for the
-arm) so a curved metric plugs in later without touching splat placement.
+``T²`` (``dim=2``) is the configuration space of a 2-joint revolute arm; the same construction
+generalizes to any ``dim`` joints. Splats are placed *intrinsically* (angle space), evaluated at the
+wrapped log map ``wrap(θ − B)`` so periodicity is automatic and the model dimension equals the joint
+count. The metric is kept separate (``metric_inv``: identity here, ``M(θ)⁻¹`` for the arm) so a
+curved metric plugs in later without touching splat placement.
 
 This is a straight port of the environment-specific half of the original
 ``torus.py`` (see git history) behind the ``Environment`` interface in
-``srms/environments/base.py``.
+``srms/environments/base.py``, generalized from a fixed ``T²`` to ``Tⁿ``.
+Grid/ground-truth (dense fast marching) and rendering only make sense for ``dim=2``
+(a dense grid is intractable and unplottable beyond that) and raise ``NotImplementedError``
+otherwise; training itself (mesh-free collocation) works at any ``dim``.
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-Obstacle = tuple[float, float, float]
+Obstacle = tuple[float, ...]  # (*centre[dim], radius)
 
 _OBSTACLE_SEED_OFFSET = 5
 
@@ -37,45 +40,49 @@ def _wrap_np(angle: np.ndarray) -> np.ndarray:
 
 @dataclasses.dataclass
 class TorusEnvironment:
-    """Flat T² with a smooth slowness field rising around circular obstacles."""
+    """Flat Tⁿ with a smooth slowness field rising around spherical obstacles."""
 
-    start: tuple[float, float] = (-1.5, -1.5)
+    start: tuple[float, ...] = (-1.5, -1.5)
+    dim: int = 2
     num_obstacles: int = 3
     obstacle_radius: tuple[float, float] = (0.5, 0.9)
     slowness_max: float = 10.0
     slow_width: float = 0.15
     seed: int = 1
 
-    dim: int = dataclasses.field(default=2, init=False)
-    domain: tuple[float, float] = dataclasses.field(default=(-float(np.pi), float(np.pi)), init=False)
-    axis_labels: tuple[str, str] = dataclasses.field(default=("θ1 (deg)", "θ2 (deg)"), init=False)
-    render_extent: tuple[float, float, float, float] = dataclasses.field(
-        default=(-180.0, 180.0, -180.0, 180.0), init=False
-    )
-
     def __post_init__(self) -> None:
+        if len(self.start) != self.dim:
+            raise ValueError(f"start has {len(self.start)} coords but dim={self.dim}")
+        self.tangent_dim = self.dim
+        self.domain: tuple[float, float] = (-float(np.pi), float(np.pi))
+        self.axis_labels: tuple[str, str] = ("θ1 (deg)", "θ2 (deg)")
+        self.render_extent: tuple[float, float, float, float] = (-180.0, 180.0, -180.0, 180.0)
         self.obstacles: tuple[Obstacle, ...] = self._sample_obstacles()
 
     @property
     def title(self) -> str:
-        return f"torus T² — time-to-go ({self.num_obstacles} obstacles)"
+        return f"torus T^{self.dim} — time-to-go ({self.num_obstacles} obstacles)"
 
     def _sample_obstacles(self) -> tuple[Obstacle, ...]:
-        """Reproducible circular obstacles in angle space, clear of the source."""
+        """Reproducible spherical obstacles in angle space, clear of the source."""
         rng = np.random.default_rng(self.seed + _OBSTACLE_SEED_OFFSET)
         start = np.asarray(self.start)
         obstacles: list[Obstacle] = []
         while len(obstacles) < self.num_obstacles:
-            centre = rng.uniform(-np.pi, np.pi, size=2)
+            centre = rng.uniform(-np.pi, np.pi, size=self.dim)
             radius = float(rng.uniform(*self.obstacle_radius))
             if np.linalg.norm(_wrap_np(centre - start)) > radius + 0.3:
-                obstacles.append((float(centre[0]), float(centre[1]), radius))
+                obstacles.append((*centre.tolist(), radius))
         return tuple(obstacles)
 
     # ---- manifold geometry -----------------------------------------------
 
     def log_map(self, mu: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
         """Wrapped displacement x -/ mu — the flat-torus log map."""
+        return wrap(x - mu)
+
+    def log_map_ambient(self, mu: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
+        """Flat torus: identical to log_map (ambient chart coincides with the tangent frame)."""
         return wrap(x - mu)
 
     def jac_factor(self, mu: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
@@ -92,9 +99,15 @@ class TorusEnvironment:
         """Wrapped tangent vector pointing from a to b."""
         return _wrap_np(b - a)
 
+    def boundary_ring_np(self, rng: np.random.Generator, eps: float, n: int) -> np.ndarray:
+        """``n`` points on a flat sphere of radius eps around the source."""
+        z = rng.standard_normal((n, self.dim)).astype(np.float64)
+        z /= np.linalg.norm(z, axis=-1, keepdims=True) + 1e-12
+        return _wrap_np(np.asarray(self.start) + eps * z)
+
     def metric_inv(self, theta: jnp.ndarray) -> jnp.ndarray:
         """Inverse metric g^{ij}; identity for the flat torus (the arm swaps in M(θ)⁻¹)."""
-        return jnp.eye(2)
+        return jnp.eye(self.dim)
 
     def geodesic(self, theta: jnp.ndarray, start: jnp.ndarray) -> jnp.ndarray:
         """Analytic flat-torus geodesic distance ‖wrap(θ − start)‖ (the known base)."""
@@ -103,9 +116,9 @@ class TorusEnvironment:
     # ---- obstacle / slowness field -----------------------------------------
 
     def sdf(self, thetas: jnp.ndarray) -> jnp.ndarray:
-        """Signed distance (wrapped) to the union of obstacle circles."""
+        """Signed distance (wrapped) to the union of obstacle balls."""
         per = [
-            jnp.linalg.norm(wrap(thetas - jnp.array([c1, c2])), axis=-1) - r for c1, c2, r in self.obstacles
+            jnp.linalg.norm(wrap(thetas - jnp.array(obs[:-1])), axis=-1) - obs[-1] for obs in self.obstacles
         ]
         return jnp.min(jnp.stack(per, axis=0), axis=0)
 
@@ -116,7 +129,7 @@ class TorusEnvironment:
     def sdf_np(self, points: np.ndarray) -> np.ndarray:
         """NumPy signed distance (host-side, for RRT*'s hot loop)."""
         return np.min(
-            [np.linalg.norm(_wrap_np(points - np.array([c1, c2])), axis=-1) - r for c1, c2, r in self.obstacles],
+            [np.linalg.norm(_wrap_np(points - np.array(obs[:-1])), axis=-1) - obs[-1] for obs in self.obstacles],
             axis=0,
         )
 
@@ -128,22 +141,29 @@ class TorusEnvironment:
     # ---- sampling / ground truth --------------------------------------------
 
     def sample_domain(self, rng: np.random.Generator, n: int) -> np.ndarray:
-        """Uniform samples in [-π, π)²."""
+        """Uniform samples in [-π, π)^dim."""
         return rng.uniform(-np.pi, np.pi, size=(n, self.dim))
 
     def grid(self, resolution: int) -> tuple[jnp.ndarray, tuple[int, int]]:
         """Grid of θ over [-π, π)², raveled to [resolution², 2], plus its (resolution, resolution) shape."""
+        if self.dim != 2:
+            raise NotImplementedError("grid()/ground_truth() need a dense grid — only tractable at dim=2")
         axis = np.linspace(-np.pi, np.pi, resolution, endpoint=False)
         grid1, grid2 = np.meshgrid(axis, axis)
         thetas_np = np.stack([grid1.ravel(), grid2.ravel()], axis=-1)
         return jnp.asarray(thetas_np, dtype=jnp.float32), (resolution, resolution)
 
-    def ground_truth(self, resolution: int, start: tuple[float, float] | None = None) -> np.ndarray:
+    def ground_truth(self, resolution: int, start: tuple[float, ...] | None = None) -> np.ndarray:
         """Periodic fast marching of |∇T| = 1/speed on the flat-torus grid; returns a raveled array."""
         start = self.start if start is None else start
         thetas, shape = self.grid(resolution)
         speed = 1.0 / np.asarray(self.slowness(thetas)).reshape(shape)
         return _fast_marching_torus(speed, start, resolution).ravel()
+
+    def render_marker_deg(self) -> tuple[float, float]:
+        """(θ1, θ2) position of the source in degrees (only meaningful at dim=2)."""
+        deg = np.degrees(np.asarray(self.start))
+        return float(deg[0]), float(deg[1])
 
 
 def _fast_marching_torus(speed: np.ndarray, start: tuple[float, float], n: int) -> np.ndarray:

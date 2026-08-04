@@ -1,9 +1,9 @@
 """RRT* prior over an Environment: mesh-free, dimension-scalable cost-to-come anchors.
 
 Generic over any ``Environment`` (see ``srms/environments/base.py``) — the
-algorithm only needs ``domain``/``dim`` for sampling and
+algorithm only needs ``sample_domain`` for random configurations and
 ``displacement_np``/``wrap_point_np``/``slowness_np`` for edge costs, so it
-carries over unchanged to a future non-torus environment.
+carries over unchanged across manifolds (torus, sphere, ...).
 
 Ported from the original ``torus.py``'s ``rrt_star``/``rrt_star_anchors``/
 ``rrt_star_anchors_shadow``/``build_roadmap``.
@@ -28,7 +28,6 @@ def rrt_star(
     """
     rng = np.random.default_rng(seed + _RRT_SEED_OFFSET)
     start = np.asarray(start, dtype=float)
-    lo, hi = env.domain
 
     def edge_cost(a: np.ndarray, b: np.ndarray) -> float:
         ts = np.linspace(0.0, 1.0, 6)[:, None]
@@ -40,7 +39,7 @@ def rrt_star(
     costs = [0.0]
     node_arr = np.array(nodes)
     for _ in range(iters):
-        q_rand = rng.uniform(lo, hi, size=env.dim)
+        q_rand = env.sample_domain(rng, 1)[0]
         distances = np.linalg.norm(env.displacement_np(q_rand, node_arr), axis=1)
         near = int(distances.argmin())
         direction = env.displacement_np(node_arr[near], q_rand)

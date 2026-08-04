@@ -2,8 +2,8 @@
 
 Generalizes the original ``torus.py``'s ``main`` to dispatch through the
 ``STRATEGIES`` registry instead of an inline solver dict, and to build the
-environment (obstacles, slowness field, ground truth) from ``TorusEnvironment``
-instead of module-level torus functions.
+environment (obstacles, slowness field, ground truth) from the ``ENVIRONMENTS``
+registry (``srms/environments``) instead of module-level torus functions.
 """
 
 from __future__ import annotations
@@ -16,8 +16,7 @@ import jax
 import numpy as np
 import tyro
 
-from srms.environments import sampling
-from srms.environments.torus import TorusEnvironment
+from srms.environments import ENVIRONMENTS, sampling
 from srms.methods.backends import BACKENDS
 from srms.methods.strategies import eikonal, weak_supervision
 from srms.viz import render
@@ -27,21 +26,28 @@ STRATEGIES = {"eikonal": eikonal, "weak_supervision": weak_supervision}
 
 @dataclasses.dataclass
 class Config:
-    """Configuration for a torus Eikonal splat solve with obstacles.
+    """Configuration for an Eikonal splat solve with obstacles on a chosen manifold.
 
     Attributes:
+        environment: ``torus`` (flat Tⁿ, e.g. an n-joint revolute arm's configuration space) or
+            ``sphere`` (Sⁿ embedded in R^(n+1)).
+        dim: intrinsic manifold dimension — the ``n`` in Tⁿ / Sⁿ. Training (mesh-free collocation)
+            works at any dim; the dense-grid ground truth (fast marching) and rendering only make
+            sense at dim=2 (a dense grid is intractable and unplottable beyond that) and are skipped
+            for dim>2 — only the final training loss is reported.
         method: ``eikonal`` (free field, BC ring + PDE residual loss) or
             ``weak_supervision`` (RRT* soft-min base × exp(correction) refinement).
         backend: the function-approximator backend the strategy trains (see
             ``srms/methods/backends``) — ``srm`` (splat mixture) or ``mlp`` (SIREN-style
             periodic-activation MLP).
 
-        Scene — start: source joint angles (rad); num_obstacles / obstacle_radius: count and
-            inclusive (min, max) radius of the circular angle-space obstacles; slowness_max /
+        Scene — start: source point (rad joint angles for torus, unit ambient vector for sphere;
+            defaults to a dim-appropriate point if left unset); num_obstacles / obstacle_radius:
+            count and inclusive (min, max) angular radius of the obstacles; slowness_max /
             slow_width: peak slowness inside obstacles and the ramp width (rad).
 
-        Eikonal strategy — source_radius: BC-sphere radius / PDE collocation exclusion radius
-            around the source; n_sphere: number of BC points on that sphere; physics_weight:
+        Eikonal strategy — source_radius: BC-ring geodesic radius / PDE collocation exclusion
+            radius around the source; n_sphere: number of BC points on that ring; physics_weight:
             weight on the PDE loss term relative to the boundary-condition loss.
 
         Weak-supervision strategy (RRT*) — rrt_iters / rrt_step / rrt_radius: RRT* tree size,
@@ -53,13 +59,16 @@ class Config:
             mlp_omega0: SIREN frequency scale for the hidden-layer init (Sitzmann et al.).
 
         Training / output — num_splats, num_collocation, steps, lr, init_scale, resolution
-            (eval + FMM grid), seed, error_clip (error colour limit), checkpoint_every, out_dir.
+            (eval + FMM grid, dim=2 only), seed, error_clip (error colour limit),
+            checkpoint_every, out_dir.
     """
 
+    environment: Literal["torus", "sphere"] = "torus"
+    dim: int = 2
     method: Literal["eikonal", "weak_supervision"] = "eikonal"
     backend: Literal["srm", "mlp"] = "srm"
     # scene
-    start: tuple[float, float] = (-1.5, -1.5)
+    start: tuple[float, ...] | None = None
     num_obstacles: int = 3
     obstacle_radius: tuple[float, float] = (0.5, 0.9)
     slowness_max: float = 10.0
@@ -93,20 +102,42 @@ class Config:
     out_dir: str = "figures"
 
 
-def main(cfg: Config) -> None:
-    """Solve the torus Eikonal with obstacles and score against periodic fast marching."""
-    env = TorusEnvironment(
-        start=cfg.start,
+def _build_env(cfg: Config):
+    """Construct the configured Environment, filling in a dim-appropriate default start if unset."""
+    if cfg.environment == "torus":
+        start = cfg.start if cfg.start is not None else (-1.5,) * cfg.dim
+        return ENVIRONMENTS["torus"](
+            start=start,
+            dim=cfg.dim,
+            num_obstacles=cfg.num_obstacles,
+            obstacle_radius=cfg.obstacle_radius,
+            slowness_max=cfg.slowness_max,
+            slow_width=cfg.slow_width,
+            seed=cfg.seed,
+        )
+    start = cfg.start if cfg.start is not None else (0.0,) * cfg.dim + (1.0,)
+    return ENVIRONMENTS["sphere"](
+        start=start,
+        n=cfg.dim,
         num_obstacles=cfg.num_obstacles,
         obstacle_radius=cfg.obstacle_radius,
         slowness_max=cfg.slowness_max,
         slow_width=cfg.slow_width,
         seed=cfg.seed,
     )
+
+
+def main(cfg: Config) -> None:
+    """Solve the Eikonal PDE with obstacles and, at dim=2, score against a dense fast-marching grid."""
+    env = _build_env(cfg)
     backend = BACKENDS[cfg.backend]
-    thetas, shape = env.grid(cfg.resolution)
-    gt = env.ground_truth(cfg.resolution)
-    inside = np.asarray(env.sdf(thetas)) < 0.0
+    dense = cfg.dim == 2  # grid ground truth / rendering only tractable at dim=2
+
+    thetas = shape = gt = inside = None
+    if dense:
+        thetas, shape = env.grid(cfg.resolution)
+        gt = env.ground_truth(cfg.resolution)
+        inside = np.asarray(env.sdf(thetas)) < 0.0
 
     roadmap = None
     if cfg.method == "weak_supervision":
@@ -122,14 +153,16 @@ def main(cfg: Config) -> None:
             )
         return np.asarray(eikonal.predict(backend, current, thetas, env))
 
-    def checkpoint(current, stepnum: int) -> None:
-        marks = render(env, cfg, gt, predict_current(current), inside, shape, out_name=f"torus_ckpt_{stepnum}.png")
-        print(f"  [ckpt {stepnum}] saved torus_ckpt_{stepnum}.png  RMS={marks['rms']:.4e}", flush=True)
+    checkpoint = None
+    if dense:
+
+        def checkpoint(current, stepnum: int) -> None:
+            out_name = f"{cfg.environment}_ckpt_{stepnum}.png"
+            marks = render(env, cfg, gt, predict_current(current), inside, shape, out_name=out_name)
+            print(f"  [ckpt {stepnum}] saved {out_name}  RMS={marks['rms']:.4e}", flush=True)
 
     strategy = STRATEGIES[cfg.method]
     splat = strategy.solve(env, cfg, backend, checkpoint)
-    prediction = predict_current(splat)
-    metrics = render(env, cfg, gt, prediction, inside, shape)
     with open(f"{cfg.out_dir}/splat.pkl", "wb") as f:  # save params + scene for the near-obstacle diagnostic
         pickle.dump(
             {
@@ -139,7 +172,16 @@ def main(cfg: Config) -> None:
             },
             f,
         )
-    print(f"saved {cfg.out_dir}/torus_obstacles.png  ({len(env.obstacles)} obstacles)")
+
+    if not dense:
+        print(f"dim={cfg.dim} > 2: no dense-grid ground truth / rendering (intractable past dim=2); training done.")
+        print(f"saved {cfg.out_dir}/splat.pkl  ({len(env.obstacles)} obstacles)")
+        return
+
+    out_name = f"{cfg.environment}_obstacles.png"
+    prediction = predict_current(splat)
+    metrics = render(env, cfg, gt, prediction, inside, shape, out_name=out_name)
+    print(f"saved {cfg.out_dir}/{out_name}  ({len(env.obstacles)} obstacles)")
     print(f"RMS={metrics['rms']:.4e}  max|err|={metrics['max_abs']:.4e}  rel_RMS={metrics['rel_rms']:.4e}")
 
 

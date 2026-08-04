@@ -17,7 +17,7 @@ def render(
 ) -> dict:
     """Save a [GT | prediction | error] figure over the environment's chart and return metrics."""
     extent = env.render_extent
-    marker = tuple(np.degrees(np.asarray(env.start)))
+    marker = env.render_marker_deg()
     gt_img = np.where(inside, np.nan, gt).reshape(shape)
     pred_img = np.where(inside, np.nan, prediction).reshape(shape)
     error_img = pred_img - gt_img
