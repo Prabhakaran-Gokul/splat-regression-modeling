@@ -13,6 +13,7 @@ import pickle
 from typing import Literal
 
 import jax
+import mlflow
 import numpy as np
 import tyro
 
@@ -60,7 +61,7 @@ class Config:
 
         Training / output — num_splats, num_collocation, steps, lr, init_scale, resolution
             (eval + FMM grid, dim=2 only), seed, error_clip (error colour limit),
-            checkpoint_every, out_dir.
+            checkpoint_every, log_every (training-metric logging cadence, incl. mlflow), out_dir.
     """
 
     environment: Literal["torus", "sphere"] = "torus"
@@ -99,6 +100,7 @@ class Config:
     seed: int = 1
     error_clip: float = 0.2
     checkpoint_every: int = 1500
+    log_every: int = 25
     out_dir: str = "figures"
 
 
@@ -160,29 +162,41 @@ def main(cfg: Config) -> None:
             out_name = f"{cfg.environment}_ckpt_{stepnum}.png"
             marks = render(env, cfg, gt, predict_current(current), inside, shape, out_name=out_name)
             print(f"  [ckpt {stepnum}] saved {out_name}  RMS={marks['rms']:.4e}", flush=True)
+            mlflow.log_metric("ckpt_rms", marks["rms"], step=stepnum)
 
-    strategy = STRATEGIES[cfg.method]
-    splat = strategy.solve(env, cfg, backend, checkpoint)
-    with open(f"{cfg.out_dir}/splat.pkl", "wb") as f:  # save params + scene for the near-obstacle diagnostic
-        pickle.dump(
-            {
-                "splat": jax.tree_util.tree_map(np.asarray, splat),
-                "obstacles": env.obstacles,
-                "cfg": dataclasses.asdict(cfg),
-            },
-            f,
-        )
+    run_name = f"{cfg.environment}-{cfg.method}-{cfg.backend}-d{cfg.dim}"
+    with mlflow.start_run(run_name=run_name):
+        mlflow.log_params(dataclasses.asdict(cfg))
 
-    if not dense:
-        print(f"dim={cfg.dim} > 2: no dense-grid ground truth / rendering (intractable past dim=2); training done.")
-        print(f"saved {cfg.out_dir}/splat.pkl  ({len(env.obstacles)} obstacles)")
-        return
+        def progress_fn(step: int, metrics: dict) -> None:
+            mlflow.log_metrics(metrics, step=step)
 
-    out_name = f"{cfg.environment}_obstacles.png"
-    prediction = predict_current(splat)
-    metrics = render(env, cfg, gt, prediction, inside, shape, out_name=out_name)
-    print(f"saved {cfg.out_dir}/{out_name}  ({len(env.obstacles)} obstacles)")
-    print(f"RMS={metrics['rms']:.4e}  max|err|={metrics['max_abs']:.4e}  rel_RMS={metrics['rel_rms']:.4e}")
+        strategy = STRATEGIES[cfg.method]
+        splat = strategy.solve(env, cfg, backend, checkpoint, progress_fn=progress_fn)
+        with open(f"{cfg.out_dir}/splat.pkl", "wb") as f:  # save params + scene for the near-obstacle diagnostic
+            pickle.dump(
+                {
+                    "splat": jax.tree_util.tree_map(np.asarray, splat),
+                    "obstacles": env.obstacles,
+                    "cfg": dataclasses.asdict(cfg),
+                },
+                f,
+            )
+
+        if not dense:
+            print(
+                f"dim={cfg.dim} > 2: no dense-grid ground truth / rendering (intractable past dim=2); training done."
+            )
+            print(f"saved {cfg.out_dir}/splat.pkl  ({len(env.obstacles)} obstacles)")
+            return
+
+        out_name = f"{cfg.environment}_obstacles.png"
+        prediction = predict_current(splat)
+        metrics = render(env, cfg, gt, prediction, inside, shape, out_name=out_name)
+        mlflow.log_metrics({f"final_{k}": v for k, v in metrics.items()})
+        mlflow.log_artifact(f"{cfg.out_dir}/{out_name}")
+        print(f"saved {cfg.out_dir}/{out_name}  ({len(env.obstacles)} obstacles)")
+        print(f"RMS={metrics['rms']:.4e}  max|err|={metrics['max_abs']:.4e}  rel_RMS={metrics['rel_rms']:.4e}")
 
 
 if __name__ == "__main__":

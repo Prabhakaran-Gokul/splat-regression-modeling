@@ -85,8 +85,12 @@ def roadmap_residual(
     return q + 1.0 / q - 2.0
 
 
-def solve(env, cfg, backend, checkpoint=None):
-    """Fit a small correction on top of a coarse RRT*-roadmap base."""
+def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
+    """Fit a small correction on top of a coarse RRT*-roadmap base.
+
+    ``progress_fn(step, metrics)``, if given, is called every ``cfg.log_every`` steps with a dict of
+    scalar training metrics (``loss``, ``residual``, ``reg``) — e.g. to log to mlflow (see ``run.py``).
+    """
     params = backend.init_params(jax.random.PRNGKey(cfg.seed), env, cfg)
     nodes, costs = sampling.build_roadmap(
         env, env.start, cfg.rrt_iters, cfg.rrt_step, cfg.rrt_radius, cfg.roadmap_nodes, cfg.seed
@@ -99,21 +103,25 @@ def solve(env, cfg, backend, checkpoint=None):
     def loss_fn(p, colloc, slow):
         residual = roadmap_residual(backend, p, colloc, slow, nodes, costs, cfg.roadmap_gamma, env, cfg.roadmap_hop)
         correction = backend.eval_raw(p, colloc, env).ravel()
-        return jnp.mean(residual**2) + cfg.base_reg * jnp.mean(correction**2)
+        residual_loss = jnp.mean(residual**2)
+        reg_loss = cfg.base_reg * jnp.mean(correction**2)
+        return residual_loss + reg_loss, {"residual": residual_loss, "reg": reg_loss}
 
     @jax.jit
     def step(p, state, colloc, slow):
-        loss, grads = jax.value_and_grad(loss_fn)(p, colloc, slow)
+        (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(p, colloc, slow)
         updates, state = optimizer.update(grads, state, p)
-        return optax.apply_updates(p, updates), state, loss
+        return optax.apply_updates(p, updates), state, loss, aux
 
     progress = trange(cfg.steps, desc="weak_supervision")
     for i in progress:
         colloc = jnp.asarray(env.sample_domain(rng, cfg.num_collocation), dtype=jnp.float32)
         slow = env.slowness(colloc)
-        params, opt_state, loss = step(params, opt_state, colloc, slow)
-        if i % 25 == 0:
+        params, opt_state, loss, aux = step(params, opt_state, colloc, slow)
+        if i % cfg.log_every == 0:
             progress.set_description(f"weak_supervision — log10(loss) = {float(jnp.log10(loss + 1e-12)):.3f}")
+            if progress_fn is not None:
+                progress_fn(i, {"loss": float(loss), "residual": float(aux["residual"]), "reg": float(aux["reg"])})
         if checkpoint is not None and i > 0 and i % cfg.checkpoint_every == 0:
             checkpoint(params, i)
     return params

@@ -56,8 +56,12 @@ def pde_residual(backend, params, thetas: jnp.ndarray, slow: jnp.ndarray, env) -
     return grad_norm - 1.0 / slow
 
 
-def solve(env, cfg, backend, checkpoint=None):
-    """Fit a free field to the Eikonal PDE with a small-sphere boundary condition at the source."""
+def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
+    """Fit a free field to the Eikonal PDE with a small-sphere boundary condition at the source.
+
+    ``progress_fn(step, metrics)``, if given, is called every ``cfg.log_every`` steps with a dict of
+    scalar training metrics (``loss``, ``bc``, ``pde``) — e.g. to log to mlflow (see ``run.py``).
+    """
     params = backend.init_params(jax.random.PRNGKey(cfg.seed), env, cfg)
     rng = np.random.default_rng(cfg.seed)
     src_pts, src_vals = source_sphere(env, cfg.source_radius, cfg.n_sphere, cfg.seed)
@@ -68,21 +72,23 @@ def solve(env, cfg, backend, checkpoint=None):
     def loss_fn(p, colloc, slow):
         bc = jnp.mean((predict(backend, p, src_pts, env) - src_vals) ** 2)
         pde = jnp.mean(pde_residual(backend, p, colloc, slow, env) ** 2)
-        return bc + cfg.physics_weight * pde
+        return bc + cfg.physics_weight * pde, {"bc": bc, "pde": pde}
 
     @jax.jit
     def step(p, state, colloc, slow):
-        loss, grads = jax.value_and_grad(loss_fn)(p, colloc, slow)
+        (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(p, colloc, slow)
         updates, state = optimizer.update(grads, state, p)
-        return optax.apply_updates(p, updates), state, loss
+        return optax.apply_updates(p, updates), state, loss, aux
 
     progress = trange(cfg.steps, desc="eikonal")
     for i in progress:
         colloc = sample_collocation(env, rng, cfg.num_collocation, cfg.source_radius)
         slow = env.slowness(colloc)
-        params, opt_state, loss = step(params, opt_state, colloc, slow)
-        if i % 25 == 0:
+        params, opt_state, loss, aux = step(params, opt_state, colloc, slow)
+        if i % cfg.log_every == 0:
             progress.set_description(f"eikonal — log10(loss) = {float(jnp.log10(loss + 1e-12)):.3f}")
+            if progress_fn is not None:
+                progress_fn(i, {"loss": float(loss), "bc": float(aux["bc"]), "pde": float(aux["pde"])})
         if checkpoint is not None and i > 0 and i % cfg.checkpoint_every == 0:
             checkpoint(params, i)
     return params
