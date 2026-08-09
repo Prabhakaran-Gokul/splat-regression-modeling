@@ -48,6 +48,67 @@ rises at fixed budget (2→3→4-D) — not raw node count. Whether the physics 
 make-or-break. A **stronger base construction** at fixed samples (e.g. graph shortest-path over RRT*
 *edges* instead of the straight-hop softmin) is the untried lever if it doesn't.
 
+**Fixed-budget dimension sweep** (`torus_nd.py`, isotropic flat torus, 300 RRT* nodes, Godunov-Eikonal
+GT). As dimension rises at fixed budget: dispersion 0.19→0.47→0.59, base RMS 0.113→0.201→0.333, refined
+0.115→0.169→0.322; physics gap ~0 → +0.032 → +0.011. So error grows ~linearly with dimension (curse is
+real, not beaten), fields stay usable through 4-D, and the refinement helps in 3-4D but modestly and
+*non-monotonically* (the collocation itself thins in 4-D, so both prior and PDE degrade). Graceful
+degradation, consistent with the 2-D thinning slope — supporting evidence the SRM works across
+dimensions, not a claim it defeats the curse. `torus_nd.py` is self-contained (does not touch `torus.py`).
+
+**Stress test — does the PDE genuinely help, or is it just the RRT* prior?** (`stress_test.py`, 10 d=2
+scenes, obstacles 1→10, 300 RRT* nodes, aligned params.) **Every scene improved: mean +25% RMS, +29%
+max-error reduction (range +11% to +33%).** So the physics is not collapsing and is not "just RRT*" —
+it robustly refines the prior across complexities. A single easy scene can show ~+4% (base already
+near-perfect); the *distribution* is what shows the ~25% contribution. Corroborates the earlier
+refine-experiment finding (physics helps most where the base is worst). Note on `torus_nd.py`: it must
+use `torus.py`-aligned params (obstacle 0.5–0.9, ramp 0.15, gamma 0.01, 4000 steps) — earlier drift to
+harder obstacles + gamma 0.02 muted both the numbers and the PDE, which looked like "PDE not helping".
+
+**3-D base_reg / capacity sweep** (`capacity_3d.py`, fixed 2048 collocation, 600-node base RMS 0.188).
+The weak 3-D PDE was the *regularizer* (`base_reg·mean(g²)`, `T=base·exp(g)`) winning the prior↔physics
+tug-of-war, **not** diluted collocation (random resampling accumulates coverage) and **not** capacity:
+
+| base_reg | splats | solved RMS | impr | max |
+|---|---|---|---|---|
+| 3.0 | 384 | 0.176 | +7% | 2.05 |
+| 1.0 | 384 | 0.164 | +13% | 1.38 |
+| **0.3** | 384 | **0.158** | **+16%** | **0.93** |
+| 0.1 | 384 | 0.164 | +13% | 1.13 |
+| 1.0 | 768 | 0.169 | +10% | 1.88 |
+| 1.0 | 1500 | 0.171 | +9% | 1.64 |
+
+**Lower `base_reg` restores the physics** (+7%→+16%, max 2.05→0.93); ~0.3 is the sweet spot (0.1 drifts).
+**Rule: scale `base_reg` DOWN as dimension rises.** Surprise: **more Gaussians does NOT help — it mildly
+hurts** (384→1500: 0.164→0.171), so representation capacity is *not* the 3-D bottleneck (384 suffices;
+2-D oracle already ~0.003). Training loss converges cleanly (`log10≈−2.9`) — no optimisation failure.
+**Bottom line: the PDE genuinely contributes in 2-D (+25%) and 3-D (+16% at the right base_reg); the one
+real high-d knob is the regularizer balance, not collocation count or splat count.**
+
+**Planning evaluation — the honest negative result (`planning_eval_full.py`, 2-D→4-D, 6 obstacles, naive
+−∇T descent, no guard).** SR / collision-free / path-cost-vs-FMM-optimal / ms-per-query, PDE field vs raw
+softmin base vs RRT*:
+
+| d | PDE (SR/cf/opt) | base (SR/cf/opt) | RRT* opt |
+|---|---|---|---|
+| 2 | 100/100/0.946 | 100/100/0.940 | 1.005 |
+| 3 | 100/100/0.910 | 100/100/0.908 | 0.952 |
+| 4 | 98/98/0.887 | **100/100**/0.887 | 0.921 |
+
+**The PDE never improves planning and marginally *hurts* at d=4.** Reason: RRT* cost-to-come is already a
+valid, monotone, minima-free value function; smoothing it (soft-min / splat) preserves that, so the base
+always plans and the PDE has nothing to fix — it only nudges RMS (which diminishes: +25%→+16%→+4% over
+d=2→4) and optimality marginally. **Given a roadmap, the physics is redundant for planning.** But the
+*field* (either) beats RRT*'s own cost at every dimension (0.89–0.95 vs 0.92–1.005) and plans in
+~90–150 ms/query — that win is the *representation*, not the physics.
+
+**Reframe (decision pending with user).** Do NOT frame the paper as "physics-informed planning" (that is
+NTFields/H-NTFields' turf, and our physics is light; H-NTFields itself came back to a roadmap). The
+defensible contributions: (1) an **interpretable, differentiable, manifold-native splat value function**
+with an **anisotropic Riemannian metric** (`metric_inv → M(θ)⁻¹`) that NTFields' *Euclidean* MLP cannot
+represent — the uncontested part; (2) building it **cheaply from a sparse roadmap + label-free
+self-supervision** (no FMM). Physics = the self-supervision mechanism, not the headline.
+
 **Retired / do-not-repeat:** dense (~300-node) roadmap base scored 0.070 but is *cheating* (dense RRT* is
 impossible in high-D); the screened-Poisson `φ=e^{−T/ε}` route (theory.md §5) was explored but not
 adopted — the direct Eikonal with the NTFields-style factored field won. Antipodal cut-locus sampling

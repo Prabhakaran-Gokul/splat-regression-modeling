@@ -151,7 +151,7 @@ def geodesic(theta: jnp.ndarray, start: jnp.ndarray) -> jnp.ndarray:
 
 
 def metric_inv(theta: jnp.ndarray) -> jnp.ndarray:
-    """Inverse metric ``gⁱʲ`` at ``θ``; identity for the flat torus (M6 swaps in ``M(θ)⁻¹``)."""
+    """Inverse metric ``gⁱʲ`` at ``θ``; identity for the flat torus (swap in ``M(θ)⁻¹``)."""
     return jnp.eye(2)
 
 
