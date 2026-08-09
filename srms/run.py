@@ -52,7 +52,7 @@ class Config:
             ``pntfields`` (+ viscosity + progressive speed scheduling, arXiv 2306.00616), or
             ``hntfields`` (Eikonal + temporal-difference + normal-alignment + sparse-roadmap
             travel-time bounds, all under a causality weight, arXiv 2604.13204). Each baseline is a
-            *single-source* reduction of a two-point ``T(q_s, q_g)`` paper — see the module
+            *fixed-source* form of a two-point ``T(q_s, q_g)`` paper — see the module
             docstrings in ``srms/methods/strategies`` for the full deviation list.
         backend: the function-approximator backend the strategy trains (see
             ``srms/methods/backends``) — ``srm`` (splat mixture) or ``mlp`` (SIREN-style
@@ -95,10 +95,30 @@ class Config:
             configuration-space *displacement*, so it is domain-relative: the paper's 0.02 is ~2% of
             its unit-span normalized C-space, which on this 2π-span torus corresponds to ≈0.126;
             hnt_nodes / hnt_pool / hnt_connect_radius: sphere-packing roadmap node budget, candidate
-            pool size, and the radius within which nodes are joined by collision-free straight lines.
+            pool size, and the radius within which nodes are joined by collision-free straight lines;
+            hnt_detach_causal: stop-gradient the causality weight. The released TD-NTFields code does
+            NOT detach it, but that is safe there because it predicts T directly with a bounded
+            quasimetric head; with this repo's T = base/τ, τ→0 makes T→∞ reachable, so an attached
+            weight pays the optimizer to inflate T and kill its own loss. Measured on the 2-D torus
+            at 800 steps: attached RMS 4.34 / max|err| 170 vs detached 0.63 / 6.4. Defaulted to True
+            for that reason; --no-hnt-detach-causal restores the literal released-code behaviour.
 
         MLP backend — mlp_width: hidden layer width; mlp_depth: number of hidden layers;
             mlp_omega0: SIREN frequency scale for the hidden-layer init (Sitzmann et al.).
+
+        SRM backend, adaptive densification — densify: start at init_splats and grow/prune during
+            training instead of using a fixed num_splats mixture (on by default; the fixed model is
+            --no-densify, which then uses num_splats). init_splats / max_splats: starting and maximum
+            splat count; densify_every: steps between grow/prune passes (which stop at 80% of
+            training so the model converges at a fixed structure); spawn_per: splats added per pass,
+            placed at the highest-residual free-space points; prune_thresh: weight below which a
+            splat is dropped; spawn_scale: initial covariance of a spawned splat; scale_floor:
+            minimum covariance singular value — **the** stabilizer, without which a splat collapses
+            to a gradient spike chasing the Eikonal kink and the run diverges.
+            Adaptive densification is the point of the SRM-vs-MLP comparison: the splat model picks
+            its own capacity, so the honest question is not accuracy at a matched budget but how many
+            parameters each representation needs to reach the same field. Every run logs `num_params`
+            to mlflow for exactly that reason.
 
         Training / output — num_splats, num_collocation, steps, lr, init_scale, resolution
             (eval + FMM grid, dim=2 only), seed, error_clip (error colour limit),
@@ -149,10 +169,20 @@ class Config:
     hnt_nodes: int = 300
     hnt_pool: int = 6000
     hnt_connect_radius: float = 1.5
+    hnt_detach_causal: bool = True
     # mlp backend
     mlp_width: int = 128
     mlp_depth: int = 3
     mlp_omega0: float = 30.0
+    # srm backend — adaptive densification (3DGS-style grow/prune)
+    densify: bool = True
+    init_splats: int = 64
+    max_splats: int = 512
+    densify_every: int = 400
+    spawn_per: int = 48
+    prune_thresh: float = 5e-4
+    spawn_scale: float = 0.3
+    scale_floor: float = 0.07
     # training / output
     num_splats: int = 384
     num_collocation: int = 2048
@@ -268,6 +298,7 @@ def main(cfg: Config) -> None:
         out_name = f"{cfg.environment}_obstacles.png"
         prediction = predict_current(splat)
         metrics = render(env, cfg, gt, prediction, inside, shape, out_name=out_name)
+        metrics["num_params"] = backend.num_params(splat)  # so srm/mlp are comparable at equal accuracy
         mlflow.log_metrics({f"final_{k}": v for k, v in metrics.items()})
         mlflow.log_artifact(f"{cfg.out_dir}/{out_name}")
         print(f"saved {cfg.out_dir}/{out_name}  ({len(env.obstacles)} obstacles)")

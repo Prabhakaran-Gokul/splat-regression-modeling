@@ -40,7 +40,7 @@ authors' benchmarks; that is a separate track.
 
 | # | Deviation | Why | Affects |
 |---|---|---|---|
-| 1 | **Single-source.** Papers learn a two-point `T(q_s,q_g)` with a symmetric `⊗` architecture and evaluate the loss at *both* endpoints. Here `q_s = env.start` is fixed, so only the `q_g` half exists. | A two-point field would rewrite every backend and environment; for the SRM it means splats on a product manifold. | all |
+| 1 | **Fixed source, all goals.** We learn `T(θ)` — source fixed, goal ranging over the whole manifold. Papers learn a two-point `T(q_s,q_g)` and evaluate at *both* endpoints, so only the `q_g` half exists here. | A deliberate problem setting, not a truncation: the field already spans every goal, which is what makes it a value function. A two-point field would additionally rewrite every backend and environment (for the SRM, splats on a product manifold). A different *source* means a different field — the premise of the editability study. | all |
 | 2 | **Scene speed model.** Papers use the clipped obstacle-distance ramp `S⋆ = clip(d/d_max, d_min/d_max, 1)`; this repo uses its environments' smooth `1/env.slowness`. | Property of the *scene*, identical across every strategy and backend, so it cannot bias a comparison. | all |
 | 3 | **Per-step resampled collocation** instead of a fixed dataset of sampled pairs. | House style of `eikonal.py`/`weak_supervision.py`; also removes the need for epoch bookkeeping. | all |
 | 4 | **Backend.** ResNet + workspace-CNN (NTFields/P-NTFields) and PirateNets quasimetric (TD/H-NTFields) replaced by `srm`/`mlp`. | This substitution *is* the experiment. | all |

@@ -1,6 +1,6 @@
 """P-NTFields training strategy: NTFields + viscosity + progressive speed scheduling.
 
-Port of P-NTFields (Ni & Qureshi, RSS 2023, arXiv 2306.00616) to this repo's *single-source*
+Port of P-NTFields (Ni & Qureshi, RSS 2023, arXiv 2306.00616) to this repo's *fixed-source*
 setting. P-NTFields keeps NTFields' field ``T = base/τ`` and isotropic speed loss verbatim (its
 Eq. 2 and Eq. 5 restate them) and adds exactly two mechanisms, both of which target the same
 failure mode — the physics-informed optimizer converging to a wrong local minimum "as if the
@@ -36,7 +36,7 @@ Both are on by default (``cfg.viscosity_eps``, ``cfg.alpha_*``); setting ``visco
 ``alpha_init=1.0`` recovers ``ntfields.py`` exactly, which is how the paper's own ablation
 ("w/o viscosity", "w/o scheduling") is reproduced.
 
-**Deviations from the paper** — all of ``ntfields.py``'s (single-source; ``cfg.causal`` ignored;
+**Deviations from the paper** — all of ``ntfields.py``'s (fixed-source; ``cfg.causal`` ignored;
 scene speed model; per-step resampled collocation; ``srm``/``mlp`` backend), plus:
 
 - *α schedule shape.* The paper holds ``α=0.5`` for 1000 epochs, then steps ``+1/4000`` per epoch,

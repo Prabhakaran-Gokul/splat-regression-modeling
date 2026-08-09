@@ -63,3 +63,26 @@ def eval_raw(params: MLPParams, X: jnp.ndarray, env) -> jnp.ndarray:
     for W, b in hidden:
         h = jnp.sin(h @ W + b)
     return h @ W_out + b_out
+
+
+def post_step(params: MLPParams, cfg) -> MLPParams:
+    """No-op: an MLP has no per-unit scale that can collapse, so there is nothing to project.
+
+    Present so the strategies can call ``backend.post_step`` unconditionally (see
+    ``srms/methods/backends/srm.py``, where it floors splat covariances).
+    """
+    return params
+
+
+def adapt(params: MLPParams, opt_state, residual_fn, env, cfg, rng):
+    """No-op: the MLP is a fixed-capacity model — there is no meaningful 'add a neuron where the
+    error is'. Returns the model unchanged, so a densifying run is well-defined for either backend.
+    """
+    return params, opt_state, None
+
+
+def num_params(params: MLPParams) -> int:
+    """Total trainable scalars, for matched-budget comparison against the splat mixture."""
+    import numpy as _np
+
+    return int(sum(_np.prod(_np.shape(x)) for x in jax.tree_util.tree_leaves(params)))

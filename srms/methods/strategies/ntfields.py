@@ -1,6 +1,6 @@
 """NTFields training strategy: ``T(q_s, q_g) = ‖q_s − q_g‖ / τ(q_s, q_g)``.
 
-Port of NTFields (Ni & Qureshi, ICLR 2023, arXiv 2210.00120) to this repo's *single-source* setting.
+Port of NTFields (Ni & Qureshi, ICLR 2023, arXiv 2210.00120) to this repo's *fixed-source* setting.
 Arrival time is the geodesic distance divided by a network-predicted normalized speed ``τ ∈ (0, 1]``
 (``τ=1`` ⇒ free space, straight-line unit-speed travel time; ``τ→0`` near obstacles inflates ``T``).
 ``τ`` is evaluated through whichever backend is passed in (``srms/methods/backends/{srm,mlp}``) via a
@@ -27,9 +27,13 @@ Writing ``q = S⋆/S = ‖∇T‖_{g⁻¹} · S⋆``, this is ``|1 − √q| + |
 
 **Deviations from the paper** (see also ``srms/methods/ntfields_TODO.md``):
 
-- *Single-source.* The paper learns a two-point field ``T(q_s, q_g)`` with a symmetric ``⊗``
-  architecture and evaluates Eq. 4 at **both** endpoints; here ``q_s = env.start`` is fixed, so only
-  the ``q_g`` half of the loss exists. Everything else in the formulation carries over unchanged.
+- *Fixed source, all goals.* This repo learns ``T(θ)``: the source is fixed and the goal ranges over
+  the **entire manifold** — the field *is* the set of all goals, which is what makes it a value
+  function. The paper instead learns a two-point ``T(q_s, q_g)`` with a symmetric ``⊗`` architecture
+  and evaluates Eq. 4 at both endpoints, so only the ``q_g`` half of the loss exists here. This is a
+  deliberate choice of problem setting, not a truncated version of one; a different *source* means a
+  different field, which is the premise of the planned editability study. Everything else in the
+  formulation carries over unchanged.
 - *No causal weighting.* NTFields has no such term, so this strategy **ignores ``cfg.causal``**
   (it prints a note when the flag is set). H-NTFields' own ``L_C`` lives in ``hntfields.py``.
 - *Speed model.* The paper's ``S⋆`` is a clipped obstacle-distance ramp (Eq. 3); this repo's
@@ -115,7 +119,8 @@ def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
     # that can itself blow up) with no obstacle-band gating to damp collocation points that wander
     # near it. Clip proactively rather than waiting to rediscover the NaN, as weak_supervision.py and
     # this repo's archived PINN scripts do for the same loss family.
-    optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(cfg.lr))
+    # AdamW(weight_decay=0.1) matches the released implementation (NTFields models/model_3d.py).
+    optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(cfg.lr, weight_decay=0.1))
     opt_state = optimizer.init(params)
 
     def loss_fn(p, colloc, slow):
@@ -127,17 +132,33 @@ def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
     def step(p, state, colloc, slow):
         (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(p, colloc, slow)
         updates, state = optimizer.update(grads, state, p)
-        return optax.apply_updates(p, updates), state, loss, aux
+        return backend.post_step(optax.apply_updates(p, updates), cfg), state, loss, aux
+
+    def spawn_residual(pts):
+        """Where to put new capacity: the Eq. 4 speed mismatch at each candidate centre."""
+        return isotropic_loss(speed_ratio(backend, params, pts, env.slowness(pts), env, cfg.tau_bias, cfg.tau_min))
 
     progress = trange(cfg.steps, desc="ntfields")
     for i in progress:
         colloc = sample_collocation(env, rng, cfg.num_collocation, cfg.source_radius)
         slow = env.slowness(colloc)
         params, opt_state, loss, aux = step(params, opt_state, colloc, slow)
+        if cfg.densify and i > 0 and i % cfg.densify_every == 0 and i < 0.8 * cfg.steps:
+            params, opt_state, k = backend.adapt(params, opt_state, spawn_residual, env, cfg, rng)
+            if k is not None:
+                progress.write(f"[ntfields] step {i}: densify → {k} splats ({backend.num_params(params)} params)")
         if i % cfg.log_every == 0:
             progress.set_description(f"ntfields — log10(loss) = {float(jnp.log10(loss + 1e-12)):.3f}")
             if progress_fn is not None:
-                progress_fn(i, {"loss": float(loss), "eikonal": float(aux["eikonal"])})
+                progress_fn(
+                    i,
+                    {
+                        "loss": float(loss),
+                        "eikonal": float(aux["eikonal"]),
+                        "num_params": backend.num_params(params),
+                    },
+                )
         if checkpoint is not None and i > 0 and i % cfg.checkpoint_every == 0:
             checkpoint(params, i)
+    print(f"[ntfields] final model: {backend.num_params(params)} trainable parameters", flush=True)
     return params

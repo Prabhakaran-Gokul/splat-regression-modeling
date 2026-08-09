@@ -1,14 +1,14 @@
 """H-NTFields training strategy: sparse-roadmap weak supervision + PDE regularization.
 
 Port of H-NTFields — *Hierarchical* Neural Time Fields (Ni, Liu & Qureshi 2026, arXiv 2604.13204) —
-to this repo's *single-source* setting. H-NTFields extends **TD-NTFields** (Ni, Pan & Qureshi,
+to this repo's *fixed-source* setting. H-NTFields extends **TD-NTFields** (Ni, Pan & Qureshi,
 ICLR 2025, arXiv 2505.05691), not P-NTFields: it inherits that paper's three PDE losses and
 causality weight, and adds weak supervision from a sparse sphere-packing roadmap. The combined
 objective (Eq. 9) is
 
     L = (λ_E·L_E + λ_TD·L_TD + λ_N·L_N + λ_R·L_R) · L_C
 
-with, at one endpoint (this repo's single-source reduction — see *Deviations*):
+with, at one endpoint (this repo's fixed-source setting — see *Deviations*):
 
 - ``L_E  = (√(S⋆/S) − 1)²``                                     Eikonal, infinitesimal scale (Eq. 3)
 - ``L_TD = [T(θ) − Δt/S⋆(θ) − T(θ + u⋆Δt)]²``,  ``u⋆ = −∇T/‖∇T‖``   Bellman, finite scale (Eq. 4)
@@ -30,7 +30,7 @@ lower bound (triangle inequality). The paper adds/subtracts the perturbation *ra
 because its free-space speed is 1; using the slowness-integrated hop cost keeps the bounds valid
 under this repo's varying free-space slowness and reduces to the paper's form when slowness ≡ 1.
 
-**Deviations from the paper** — all of ``ntfields.py``'s (single-source; scene speed model; per-step
+**Deviations from the paper** — all of ``ntfields.py``'s (fixed-source; scene speed model; per-step
 resampling; ``srm``/``mlp`` backend), plus:
 
 - *Field parameterization.* TD-NTFields predicts ``T`` as a learned **quasimetric**
@@ -136,20 +136,35 @@ def loss_terms(backend, params, thetas, upper, lower, env, cfg):
     q = inv_speed / slow
     l_e = (jnp.sqrt(jnp.clip(q, 1e-12, None)) - 1.0) ** 2
 
-    # L_TD — Bellman over a finite step along the optimal policy u* = −∇T/‖∇T‖ (Eq. 4).
-    policy = jax.lax.stop_gradient(-grad / jnp.maximum(inv_speed, 1e-8)[:, None])
-    stepped = env.wrap_point(thetas + cfg.hnt_dt * policy)
-    l_td = (time - cfg.hnt_dt * slow - jax.vmap(t_single)(stepped)) ** 2
+    # L_TD — Bellman over a finite step (Eq. 4), following the released TD-NTFields implementation
+    # (models/metric/model_function_metric.py). Three details there differ from the paper's prose and
+    # are reproduced here, since that code is what produced the published numbers:
+    #   1. The step is `Δt·S⋆·∇T`, not the paper's unit-normalized `u⋆Δt = −∇T/‖∇T‖·Δt`. The two
+    #      coincide at convergence (‖∇T‖ = 1/S⋆ makes the displacement exactly Δt) but differ
+    #      off-optimum, where the code's step shrinks with the gradient instead of staying unit-length.
+    #   2. The **whole target** — the stepped-point travel time *and* the step's time cost — is
+    #      computed under no_grad, not just the policy direction.
+    #   3. The term is masked off wherever T < the step's time cost, i.e. within one step of the
+    #      source, where stepping would overshoot past it.
+    step_time = cfg.hnt_dt * slow  # Δt/S⋆ — time to cover a Δt-length hop at the local speed
+    target = jax.lax.stop_gradient(
+        jax.vmap(t_single)(env.wrap_point(thetas - (step_time * s_star**2)[:, None] * grad)) + step_time
+    )
+    l_td = jnp.where(time < step_time, 0.0, (time - target) ** 2)
 
-    # L_N — align ∇T with the obstacle normal, active only near obstacles via the (1 − S*) weight (Eq. 5).
+    # L_N — align ∇T with the obstacle normal, active only near obstacles (Eq. 5). The released code
+    # weights by (1.001 − S⋆) rather than (1 − S⋆), keeping the weight strictly positive in free space.
     aligned = s_star[:, None] * grad + speed_star_normal(env, thetas)
-    l_n = (1.0 - s_star) * jnp.sum(aligned**2, axis=1)
+    l_n = (1.001 - s_star) * jnp.sum(aligned**2, axis=1)
 
     # L_R — hinge onto the roadmap travel-time corridor (Eq. 8).
     l_r = jnp.maximum(0.0, time - upper) + jnp.maximum(0.0, lower - time)
 
-    # L_C — causality: learn small travel times first (Eq. 6); a weight, so stop-gradient.
-    l_c = jax.lax.stop_gradient(jnp.exp(-cfg.hnt_lambda_c * time))
+    # L_C — causality: learn small travel times first (Eq. 6). The released code does **not** detach
+    # this weight (`torch.exp(-0.5*T)` multiplies the summed terms with T still in the graph), so it
+    # is left attached here to match. Note this does give the optimizer a degenerate incentive to
+    # inflate T to shrink the weight; L_E and the roadmap bounds are what hold that in check.
+    l_c = jnp.exp(-cfg.hnt_lambda_c * jax.lax.stop_gradient(time) if cfg.hnt_detach_causal else -cfg.hnt_lambda_c * time)
     return l_e, l_td, l_n, l_r, l_c
 
 
@@ -188,16 +203,32 @@ def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
     def step(p, state, thetas, upper, lower):
         (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(p, thetas, upper, lower)
         updates, state = optimizer.update(grads, state, p)
-        return optax.apply_updates(p, updates), state, loss, aux
+        return backend.post_step(optax.apply_updates(p, updates), cfg), state, loss, aux
+
+    def spawn_residual(pts):
+        """Where to put new capacity: the genuine speed mismatch (√q − 1)², i.e. the L_E term alone."""
+        grad = ntfields.time_grad(backend, params, pts, env, cfg.tau_bias, cfg.tau_min)
+        q = ntfields.grad_norm(grad, pts, env) * speed_star(env, pts)
+        return (jnp.sqrt(jnp.clip(q, 1e-12, None)) - 1.0) ** 2
 
     progress = trange(cfg.steps, desc="hntfields")
     for i in progress:
         thetas, upper, lower = sample_perturbed(env, nodes, radii, times, rng, cfg.num_collocation)
         params, opt_state, loss, aux = step(params, opt_state, thetas, upper, lower)
+        # Densify in the first 80% of training, so the final stretch converges at a fixed structure.
+        if cfg.densify and i > 0 and i % cfg.densify_every == 0 and i < 0.8 * cfg.steps:
+            params, opt_state, k = backend.adapt(params, opt_state, spawn_residual, env, cfg, rng)
+            if k is not None:
+                progress.write(f"[hntfields] step {i}: densify → {k} splats ({backend.num_params(params)} params)")
         if i % cfg.log_every == 0:
             progress.set_description(f"hntfields — log10(loss) = {float(jnp.log10(loss + 1e-12)):.3f}")
             if progress_fn is not None:
-                progress_fn(i, {"loss": float(loss), **{k: float(v) for k, v in aux.items()}})
+                progress_fn(
+                    i,
+                    {"loss": float(loss), "num_params": backend.num_params(params)}
+                    | {k: float(v) for k, v in aux.items()},
+                )
         if checkpoint is not None and i > 0 and i % cfg.checkpoint_every == 0:
             checkpoint(params, i)
+    print(f"[hntfields] final model: {backend.num_params(params)} trainable parameters", flush=True)
     return params

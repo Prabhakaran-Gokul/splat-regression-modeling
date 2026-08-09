@@ -5,11 +5,20 @@ Motivation/related-work for **"suboptimal RRT\* prior + Eikonal PDE refinement, 
 (3 independent skeptics, majority-refute to kill; 25/25 confirmed).
 
 ## The one that matters most — H-NTFields nearly scoops the paradigm
-**H-NTFields (Ni, Liu & Qureshi, 2026, arXiv 2604.13204)** is the single closest prior work: a
-weakly-supervised framework combining **a deliberately sparse (sphere-packing) roadmap as weak
-supervision — used *not* as the final planner but for upper/lower travel-time bounds — with
-physics-informed Eikonal PDE regularization** to learn a neural time field. That is essentially our
-paradigm: *cheap suboptimal-planner prior + Eikonal refinement.* From the same lab as NTFields.
+**H-NTFields — *Hierarchical* Neural Time Fields (Ni, Liu & Qureshi, 2026, arXiv 2604.13204)** is the
+single closest prior work: a weakly-supervised framework combining **a deliberately sparse
+(sphere-packing) roadmap as weak supervision — used *not* as the final planner but for upper/lower
+travel-time bounds — with physics-informed Eikonal PDE regularization** to learn a neural time field.
+That is essentially our paradigm: *cheap suboptimal-planner prior + Eikonal refinement.* From the same
+lab as NTFields.
+
+**Correction (2026-08-09, from the paper itself):** H-NTFields extends **TD-NTFields**, *not*
+P-NTFields. Its whole PDE half — `L_E`, `L_TD`, `L_N`, the causality weight `L_C`, and the published
+weights (λ_E=1e-2, λ_TD=1e-3, λ_N=1e-3, λ_C=0.5, Δt=0.02) — is inherited from that paper; H-NTFields
+adds only the roadmap-bound hinge `L_R` and the sphere-packing/perturbation sampling. Its final
+objective is `L = (λ_E L_E + λ_TD L_TD + λ_N L_N + λ_R L_R)·L_C` (Eq. 9). Note also that its `L_E` is
+the **squared one-directional** `(√(S⋆/S) − 1)²`, a *different* Eikonal loss from NTFields' isotropic
+Eq. 4 — the two papers do not share a loss, and conflating them is a fidelity error.
 
 It also **corroborates our core empirical finding**: pure PDE-only Eikonal solvers "collapse into
 local minima or underestimate long-range travel times without additional structural guidance," and
@@ -22,6 +31,13 @@ roadmap upper/lower *bounds*; (2) a **splat / Gaussian-mixture value representat
 (3) an **anisotropic-metric configuration-space torus / manifold** formulation. Reposition the paper
 around these three, not around "planner prior + PDE."
 
+### TD-NTFields — the missing link in the lineage
+- **TD-NTFields** (Ni, Pan & Qureshi, ICLR 2025, arXiv 2505.05691, code `ruiqini/ntrl-demo`): recasts
+  travel time as an **optimal value function** and adds Bellman consistency at a *finite* scale
+  (`L_TD`), obstacle-normal alignment (`L_N`), and a causality curriculum (`L_C = exp(−λ_C T)`). It also
+  **drops the `‖q_s−q_g‖/τ` factorization**, predicting `T` directly as a learned quasimetric
+  `D(f(q_s), f(q_g))` — so the NTFields factored field is *not* part of this branch of the lineage.
+
 ## 1. Physics-informed Eikonal neural planners (the pure-physics line, our B2/B3)
 - **EikoNet** (Smith et al. 2020, arXiv 2004.00361): solves the Eikonal PDE self-supervised, "without
   ever needing solutions from a finite-difference algorithm"; origin of the factored travel time.
@@ -33,8 +49,10 @@ around these three, not around "planner prior + PDE."
 - **P-NTFields** (Ni & Qureshi, RSS 2023, arXiv 2306.00616): adds (a) a **viscosity term**
   `1/S = ‖∇T‖ + ε·ΔT` (vanishing-viscosity ⇒ smooth *unique* solution — the level/shock selector),
   and (b) a **progressive speed-annealing curriculum** `S*_α = (1−α)+α·S*`, `α: 0→1` from the trivial
-  constant-speed field toward sharp obstacles. (We reproduce as B3; our `λ:0→1` anneal is this. Note:
-  we have an `epsilon` viscosity knob but default 0 — **P-NTFields uses viscosity; worth switching on.**)
+  constant-speed field toward sharp obstacles. **Correction (2026-08-09):** this is linear in *speed*;
+  the old `torus.py` annealed the *slowness* (`s_λ = 1 + λ(s−1)`), a different path through field
+  space — so the earlier claim that "our `λ:0→1` anneal is this" was wrong.
+  `srms/methods/strategies/pntfields.py` now anneals in speed space and defaults `viscosity_eps=0.01` on.
 
 ## 2. Imitation / demonstration planners (the anti-MPNet contrast, our B4)
 - **MPNet** (Qureshi et al., ICRA 2019 / TRO, arXiv 1907.06013): MSE-regresses waypoints from RRT\*
@@ -90,3 +108,29 @@ Eikonal, the RRT\* prior, and the PDE refinement are the *solving vehicle*, not 
   selector; benchmark on their environments/metrics (success rate, path cost, planning time).
 
 _Sources: arXiv 2004.00361, 2210.00120, 2306.00616, 1907.06013, 1903.00104, 2411.17293, 2604.13204._
+
+
+## Verified against the released implementations (2026-08-09)
+
+Read directly from the authors' code, not inferred from the papers:
+
+- **`ruiqini/NTFields`, `models/model_3d.py`.** The loss is literally
+  `|1−√(S/S⋆)| + |1−√(S⋆/S)|` per endpoint, meaned over the batch — our `ntfields.isotropic_loss`
+  matches exactly. Optimizer is **AdamW, weight_decay=0.1**. τ is `sigmoid(0.1·y)` — a *scaled* logit
+  with **no bias**, so τ starts at 0.5, whereas our `tau_bias=4.0` starts it near 1. NTFields also uses
+  **distance-weighted sampling** (`WeightedRandomSampler`, weights ∝ `max(d)−d` clipped to
+  [0.2, 0.95]), favouring nearby start/goal pairs — we sample uniformly. And the epoch-rollback guard
+  (`diff_ratio > 1.2` ⇒ reload a random one of the last 5 states) is already in **NTFields**, not just
+  P-NTFields.
+- **`ruiqini/ntrl-demo`, `models/metric/model_function_metric.py`.** `L_E` is
+  `1e-2·(√(S⋆·‖∇T‖) − 1)²` — matches ours. Three `L_TD` details are *not* in the paper's prose: the
+  step is `Δt·S⋆·∇T` rather than the unit-normalized `u⋆Δt`; the **entire target is under `no_grad`**,
+  not just the policy direction; and the term is **masked off where `T <` the step's time cost**. All
+  three are now reproduced. `L_N` weights by `(1.001 − S⋆)` and takes its normal from precomputed
+  dataset normals rather than `∇S⋆/‖∇S⋆‖`. `L_C` is **not detached** in their code.
+- **Our one forced departure.** Because we keep `T = base/τ` (their quasimetric head is inseparable
+  from a two-point field), an attached `L_C` lets the optimizer inflate `T` via `τ→0` and zero out its
+  own loss — a degenerate direction their bounded head does not have. Measured on the 2-D torus at 800
+  steps: attached **RMS 4.34 / max|err| 170** vs detached **0.63 / 6.4**. We therefore detach by
+  default (`--no-hnt-detach-causal` restores their behaviour). This is a *consequence* of the field
+  deviation, not an independent one.
