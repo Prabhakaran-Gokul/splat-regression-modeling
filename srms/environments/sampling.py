@@ -11,6 +11,8 @@ Ported from the original ``torus.py``'s ``rrt_star``/``rrt_star_anchors``/
 
 from __future__ import annotations
 
+import heapq
+
 import jax.numpy as jnp
 import numpy as np
 
@@ -125,3 +127,97 @@ def build_roadmap(
         idx = np.concatenate([[0], idx])  # keep the source node (cost 0) so T(start)=0
         nodes, costs = nodes[idx], costs[idx]
     return jnp.asarray(nodes, dtype=jnp.float32), jnp.asarray(costs, dtype=jnp.float32)
+
+
+_SPHERE_ROADMAP_SEED_OFFSET = 14
+
+
+def _edge_time(env, a: np.ndarray, b: np.ndarray, ksamp: int = 6) -> float:
+    """Travel *time* of the straight hop a→b: wrapped length × mean slowness along it."""
+    ts = np.linspace(0.0, 1.0, ksamp)[:, None]
+    disp = env.displacement_np(a, b)
+    pts = env.wrap_point_np(a[None, :] + ts * disp[None, :])
+    return float(np.linalg.norm(disp) * env.slowness_np(pts).mean())
+
+
+def _edge_is_free(env, a: np.ndarray, b: np.ndarray, ksamp: int = 12) -> bool:
+    """Straight-line collision check: every sample along the hop must be outside the obstacles."""
+    ts = np.linspace(0.0, 1.0, ksamp)[:, None]
+    disp = env.displacement_np(a, b)
+    pts = env.wrap_point_np(a[None, :] + ts * disp[None, :])
+    return bool(np.all(env.sdf_np(pts) > 0.0))
+
+
+def build_sphere_roadmap(
+    env, start, num_nodes: int, pool: int, connect_radius: float, seed: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """H-NTFields' sparse sphere-packing roadmap, plus travel time from ``start`` to each node.
+
+    Implements the roadmap of H-NTFields (Ni, Liu & Qureshi 2026, arXiv 2604.13204, Sec. IV-A):
+
+    - *Free-space volume sampling.* Draw collision-free configurations and give each a maximized
+      free sphere (radius = clearance ``env.sdf``). A candidate is accepted only if it lies **outside
+      the union of the spheres already accepted**, which is what makes the packing sparse and
+      spread-out rather than clustered.
+    - *Sparse connectivity.* Node pairs within ``connect_radius`` are joined when the straight line
+      between them is collision-free.
+    - *Distances.* Dijkstra from ``start`` (always node 0) gives the graph distance later used for
+      the travel-time bounds.
+
+    Edge weights are the **slowness-integrated** hop cost (``_edge_time``), not raw length. The
+    paper's bounds work because its free-space speed is 1, so distance *is* time; this repo's
+    ``env.slowness`` varies smoothly from 1 to ``slowness_max``, so plain lengths would bound
+    nothing. Weighting by slowness restores the bound's meaning in travel-time units.
+
+    Returns ``(nodes[N, dim], radii[N], time_from_start[N])`` for the nodes reachable from the
+    source; unreachable components are dropped.
+    """
+    rng = np.random.default_rng(seed + _SPHERE_ROADMAP_SEED_OFFSET)
+    start = np.asarray(start, dtype=float)
+
+    nodes = [start]
+    radii = [max(float(env.sdf_np(start[None, :])[0]), 1e-3)]
+    candidates = env.sample_domain(rng, pool)
+    clearance = env.sdf_np(candidates)
+    for cand, clear in zip(candidates, clearance):
+        if len(nodes) >= num_nodes:
+            break
+        if clear <= 0.0:  # inside an obstacle
+            continue
+        node_arr = np.array(nodes)
+        if np.any(np.linalg.norm(env.displacement_np(cand, node_arr), axis=1) <= np.array(radii)):
+            continue  # already covered by an accepted node's free sphere
+        nodes.append(cand)
+        radii.append(float(clear))
+    node_arr, radius_arr = np.array(nodes), np.array(radii)
+
+    n = len(node_arr)
+    adjacency: list[list[tuple[int, float]]] = [[] for _ in range(n)]
+    for i in range(n):
+        near = np.where(np.linalg.norm(env.displacement_np(node_arr[i], node_arr), axis=1) < connect_radius)[0]
+        for j in near:
+            if j <= i or not _edge_is_free(env, node_arr[i], node_arr[j]):
+                continue
+            w = _edge_time(env, node_arr[i], node_arr[j])
+            adjacency[i].append((int(j), w))
+            adjacency[j].append((i, w))
+
+    time_from_start = np.full(n, np.inf)
+    time_from_start[0] = 0.0
+    queue = [(0.0, 0)]
+    while queue:
+        d, i = heapq.heappop(queue)
+        if d > time_from_start[i]:
+            continue
+        for j, w in adjacency[i]:
+            if d + w < time_from_start[j]:
+                time_from_start[j] = d + w
+                heapq.heappush(queue, (d + w, j))
+
+    reachable = np.isfinite(time_from_start)
+    print(
+        f"[sphere-roadmap] {int(reachable.sum())}/{n} nodes reachable "
+        f"(radii {radius_arr.min():.2f}–{radius_arr.max():.2f})",
+        flush=True,
+    )
+    return node_arr[reachable], radius_arr[reachable], time_from_start[reachable]

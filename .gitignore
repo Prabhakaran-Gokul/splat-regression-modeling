@@ -10,3 +10,4 @@ logs
 *.log
 *.png
 validation.md
+mlflow.db

@@ -19,10 +19,19 @@ import tyro
 
 from srms.environments import ENVIRONMENTS, sampling
 from srms.methods.backends import BACKENDS
-from srms.methods.strategies import eikonal, ntfields, weak_supervision
+from srms.methods.strategies import eikonal, hntfields, ntfields, pntfields, weak_supervision
 from srms.viz import render
 
-STRATEGIES = {"eikonal": eikonal, "weak_supervision": weak_supervision, "ntfields": ntfields}
+STRATEGIES = {
+    "eikonal": eikonal,
+    "weak_supervision": weak_supervision,
+    "ntfields": ntfields,
+    "pntfields": pntfields,
+    "hntfields": hntfields,
+}
+
+# Strategies whose field is the NTFields T = base/τ factorization, so they share `predict`'s signature.
+_NTFIELDS_FAMILY = ("ntfields", "pntfields", "hntfields")
 
 
 @dataclasses.dataclass
@@ -36,9 +45,15 @@ class Config:
             works at any dim; the dense-grid ground truth (fast marching) and rendering only make
             sense at dim=2 (a dense grid is intractable and unplottable beyond that) and are skipped
             for dim>2 — only the final training loss is reported.
-        method: ``eikonal`` (free field, BC ring + PDE residual loss),
-            ``weak_supervision`` (RRT* soft-min base × exp(correction) refinement), or
-            ``ntfields`` (analytic-geodesic base / network-predicted speed τ).
+        method: this repo's own methods — ``eikonal`` (free field, BC ring + PDE residual loss) and
+            ``weak_supervision`` (RRT* soft-min base × exp(correction) refinement) — or one of the
+            three published baselines, all sharing the ``T = base/τ`` field so the comparison
+            isolates the objective: ``ntfields`` (isotropic speed loss, arXiv 2210.00120),
+            ``pntfields`` (+ viscosity + progressive speed scheduling, arXiv 2306.00616), or
+            ``hntfields`` (Eikonal + temporal-difference + normal-alignment + sparse-roadmap
+            travel-time bounds, all under a causality weight, arXiv 2604.13204). Each baseline is a
+            *single-source* reduction of a two-point ``T(q_s, q_g)`` paper — see the module
+            docstrings in ``srms/methods/strategies`` for the full deviation list.
         backend: the function-approximator backend the strategy trains (see
             ``srms/methods/backends``) — ``srm`` (splat mixture) or ``mlp`` (SIREN-style
             periodic-activation MLP).
@@ -65,7 +80,22 @@ class Config:
 
         NTFields strategy — tau_bias: initial sigmoid bias so τ starts near 1 (free space) at
             init; tau_min: floor of τ = τ_min + (1−τ_min)·σ(g+bias) (0 ⇒ the un-floored paper
-            formulation; >0 is an ablation against the τ→0 runaway).
+            formulation; >0 is an ablation against the τ→0 runaway). The ntfields/pntfields/
+            hntfields strategies all **ignore ``causal``** — the first two have no such term in
+            their papers, and hntfields carries its own ``L_C`` (``hnt_lambda_c``).
+
+        P-NTFields strategy (adds to the above) — viscosity_eps: ε in 1/S = ‖∇T‖ + ε·Δτ (0 disables,
+            recovering ntfields); alpha_init / alpha_hold_frac / alpha_final: the progressive
+            speed-scheduling curriculum S⋆_α = (1−α) + α·S⋆ — hold at alpha_init for alpha_hold_frac
+            of training, then ramp linearly to alpha_final (paper: 0.5, ~1/4, 1.05).
+
+        H-NTFields strategy — hnt_lambda_e / hnt_lambda_td / hnt_lambda_n / hnt_lambda_r: weights on
+            the Eikonal, temporal-difference, normal-alignment and roadmap-bound terms;
+            hnt_lambda_c: decay in the causality weight exp(−λ_C·T); hnt_dt: the TD step Δt — a
+            configuration-space *displacement*, so it is domain-relative: the paper's 0.02 is ~2% of
+            its unit-span normalized C-space, which on this 2π-span torus corresponds to ≈0.126;
+            hnt_nodes / hnt_pool / hnt_connect_radius: sphere-packing roadmap node budget, candidate
+            pool size, and the radius within which nodes are joined by collision-free straight lines.
 
         MLP backend — mlp_width: hidden layer width; mlp_depth: number of hidden layers;
             mlp_omega0: SIREN frequency scale for the hidden-layer init (Sitzmann et al.).
@@ -77,7 +107,7 @@ class Config:
 
     environment: Literal["torus", "sphere"] = "torus"
     dim: int = 2
-    method: Literal["eikonal", "weak_supervision", "ntfields"] = "eikonal"
+    method: Literal["eikonal", "weak_supervision", "ntfields", "pntfields", "hntfields"] = "eikonal"
     backend: Literal["srm", "mlp"] = "srm"
     # scene
     start: tuple[float, ...] | None = None
@@ -104,6 +134,21 @@ class Config:
     # ntfields strategy
     tau_bias: float = 4.0
     tau_min: float = 0.0
+    # pntfields strategy (P-NTFields: viscosity + progressive speed scheduling)
+    viscosity_eps: float = 0.01
+    alpha_init: float = 0.5
+    alpha_hold_frac: float = 0.25
+    alpha_final: float = 1.05
+    # hntfields strategy (H-NTFields: roadmap bounds + TD-NTFields PDE losses)
+    hnt_lambda_e: float = 1e-2
+    hnt_lambda_td: float = 1e-3
+    hnt_lambda_n: float = 1e-3
+    hnt_lambda_r: float = 1e-2
+    hnt_lambda_c: float = 0.5
+    hnt_dt: float = 0.02
+    hnt_nodes: int = 300
+    hnt_pool: int = 6000
+    hnt_connect_radius: float = 1.5
     # mlp backend
     mlp_width: int = 128
     mlp_depth: int = 3
@@ -171,7 +216,7 @@ def main(cfg: Config) -> None:
             return np.asarray(
                 weak_supervision.predict(backend, current, thetas, nodes, costs, cfg.roadmap_gamma, env, cfg.roadmap_hop)
             )
-        if cfg.method == "ntfields":
+        if cfg.method in _NTFIELDS_FAMILY:
             return np.asarray(ntfields.predict(backend, current, thetas, env, cfg.tau_bias, cfg.tau_min))
         return np.asarray(eikonal.predict(backend, current, thetas, env))
 
