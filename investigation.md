@@ -116,12 +116,14 @@ self-supervision** (no FMM). Physics = the self-supervision mechanism, not the h
 
 | Baseline | Backend | Params | RMS | max err |
 |---|---|---|---|---|
-| No weak supervision (`--hnt-lambda-r 0`) | SRM adaptive | 2,779 | 0.291 | 3.15 |
-| | MLP w=128 | 33,793 | 0.218 | 1.00 |
+| No weak supervision (`--hnt-lambda-r 0`) | SRM 397 splats | 2,779 | 0.291 | 3.15 |
+| | SRM 512 (to cap) | 3,584 | 0.255 | 1.13 |
 | | MLP w=40 | 3,521 | 0.253 | 0.89 |
-| **H-NTFields (weak supervision)** | **SRM adaptive** | **2,779** | **0.0637** | 0.395 |
-| | MLP w=128 | 33,793 | 0.0667 | 0.343 |
+| | MLP w=128 | 33,793 | 0.218 | 1.00 |
+| **H-NTFields (weak supervision)** | SRM 397 splats | 2,779 | 0.0637 | 0.395 |
+| | SRM 512 (to cap) | 3,584 | 0.0659 | 0.414 |
 | | MLP w=40 | 3,521 | 0.0650 | 0.328 |
+| | MLP w=128 | 33,793 | 0.0667 | 0.343 |
 
 **Both representations land in the same place.** With weak supervision the three runs agree to within
 5% (0.0637 / 0.0667 / 0.0650) — almost certainly inside seed noise, so *no ordering should be claimed
@@ -130,16 +132,29 @@ from this table without a seed sweep*. Weak supervision helps ~4x on both backen
 anchor result (0.177, line ~761) by 2.8x. Pure physics reproduces the historical B2/B3 plateau
 (0.291/0.218 here vs 0.331/0.307 then).
 
-**Parameter efficiency is the one real asymmetry.** The SRM matches the 33,793-param MLP at **2,779
-params (12x fewer)**, and the matched-size MLP (3,521) at 21% fewer. Caveat: the SRM's size was
-*schedule*-limited, not chosen — 64 init + 7 densify passes x 48 spawn = 397 splats, never reaching
-`max_splats=512`. A capacity sweep is needed before claiming this is the size it *needs*.
+**No parameter-efficiency advantage survives, once the SRM is run to its capacity bar.** The first
+table hinted at one (SRM 2,779 @ 0.0637 vs MLP 3,521 @ 0.0650), but that was schedule-limited: the SRM
+had grown 64 + 7x48 = 397 splats and stopped because the *schedule* ran out, never reaching
+`max_splats`. Re-run with `--densify-every 200` it saturates 512 splats by step 2600 and scores
+**0.0659 at 3,584 params** — i.e. at matched size the two representations are indistinguishable
+(0.0659 vs 0.0650), and the earlier 21% edge was noise. **Read the table as a tie at matched
+parameters, in both supervision regimes.** The 33,793-param MLP is not a baseline that was beaten; it
+is simply oversized for this problem and does no better than the 3,521-param one. Neither
+representation's floor has been found — nobody swept the MLP downward either.
 
-**Open: the SRM's max error.** Pure-physics SRM has max|err| 3.15 vs the MLP's 1.00, but with weak
-supervision the gap nearly closes (0.395 vs 0.343). That pattern fits splat **locality**: where no
-splat has support, `τ≈σ(bias)` so `T≈base`, the free-space geodesic, which under-estimates in obstacle
-shadows — exactly the level (not slope) under-determination this log has documented, and exactly what
-level supervision pins. Not yet localized; do that before treating it as established.
+**Capacity helps exactly where the level is under-determined.** Going 397 -> 512 splats *hurts*
+slightly under weak supervision (0.0637 -> 0.0659) but clearly helps without it, above all on the
+worst case: **max|err| 3.15 -> 1.13 (-64%)**, RMS 0.291 -> 0.255. That is the signature of coverage
+holes, not of missing capacity per se — extra splats fill splat-free regions where `tau ~ sigma(bias)`
+leaves `T ~ base` (the free-space geodesic, which under-estimates in obstacle shadows). Weak
+supervision pins that level directly, which is why extra capacity buys nothing once it is on.
+Consistent with the earlier 3-D sweep where more Gaussians mildly hurt.
+
+**The SRM's max error is a coverage effect — now with supporting evidence.** Pure-physics SRM had
+max|err| 3.15 vs the MLP's 1.00; raising capacity alone cut it to 1.13, and weak supervision cuts it
+to 0.395 at the *lower* capacity. Both interventions target the same thing (an unpinned level in
+splat-free shadow regions), and either one largely fixes it, which is what the locality account
+predicts. Still not localized on the map, so treat as well-supported rather than established.
 
 **Fidelity note.** The weak-supervision rows required one adaptation, measured not guessed: uncapped
 sphere-packing saturates at 78 nodes on an open torus whose roadmap paths run 1.45x optimal, so `T_lb`
