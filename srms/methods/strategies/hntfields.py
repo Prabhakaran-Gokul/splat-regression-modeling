@@ -30,6 +30,18 @@ lower bound (triangle inequality). The paper adds/subtracts the perturbation *ra
 because its free-space speed is 1; using the slowness-integrated hop cost keeps the bounds valid
 under this repo's varying free-space slowness and reduces to the paper's form when slowness ≡ 1.
 
+**Roadmap density is load-bearing, and had to be adapted.** ``T_lb`` is only a lower bound if the
+roadmap's own shortest path is near-optimal. The paper packs **5,000** nodes into cluttered Gibson
+scenes; on an open 3-obstacle torus the maximal free spheres are enormous (radii up to ~2 rad), so
+the packing saturates after ~78 nodes and its shortest paths run ~1.45× optimal — measured against
+fast marching, the "lower" bound sat *above* the true travel time at **94%** of nodes, and training
+with it was 6–8× worse than the PDE-only ablation on both backends. ``cfg.hnt_max_radius`` caps the
+free sphere so the packing cannot be dominated by a few giant spheres; at 0.3 rad the roadmap reaches
+~460 nodes, its paths are optimal to within measurement noise, and the bounds are valid again. This
+is an adaptation to an *open* scene, not a change of mechanism — but it is worth remembering that the
+node count needed for a valid bound grows with dimension, which is the same curse the roadmap prior
+was meant to dodge.
+
 **Deviations from the paper** — all of ``ntfields.py``'s (fixed-source; scene speed model; per-step
 resampling; ``srm``/``mlp`` backend), plus:
 
@@ -180,7 +192,7 @@ def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
     params = backend.init_params(jax.random.PRNGKey(cfg.seed), env, cfg)
     rng = np.random.default_rng(cfg.seed)
     nodes, radii, times = sampling.build_sphere_roadmap(
-        env, env.start, cfg.hnt_nodes, cfg.hnt_pool, cfg.hnt_connect_radius, cfg.seed
+        env, env.start, cfg.hnt_nodes, cfg.hnt_pool, cfg.hnt_connect_radius, cfg.seed, cfg.hnt_max_radius
     )
 
     optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(cfg.lr, weight_decay=0.1))

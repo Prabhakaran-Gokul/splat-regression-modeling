@@ -149,7 +149,7 @@ def _edge_is_free(env, a: np.ndarray, b: np.ndarray, ksamp: int = 12) -> bool:
 
 
 def build_sphere_roadmap(
-    env, start, num_nodes: int, pool: int, connect_radius: float, seed: int
+    env, start, num_nodes: int, pool: int, connect_radius: float, seed: int, max_radius: float = 0.0
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """H-NTFields' sparse sphere-packing roadmap, plus travel time from ``start`` to each node.
 
@@ -175,10 +175,11 @@ def build_sphere_roadmap(
     rng = np.random.default_rng(seed + _SPHERE_ROADMAP_SEED_OFFSET)
     start = np.asarray(start, dtype=float)
 
+    cap = max_radius if max_radius > 0 else np.inf  # bound the free sphere; see the note below
     nodes = [start]
-    radii = [max(float(env.sdf_np(start[None, :])[0]), 1e-3)]
+    radii = [min(max(float(env.sdf_np(start[None, :])[0]), 1e-3), cap)]
     candidates = env.sample_domain(rng, pool)
-    clearance = env.sdf_np(candidates)
+    clearance = np.minimum(env.sdf_np(candidates), cap)
     for cand, clear in zip(candidates, clearance):
         if len(nodes) >= num_nodes:
             break

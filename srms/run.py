@@ -96,6 +96,11 @@ class Config:
             its unit-span normalized C-space, which on this 2π-span torus corresponds to ≈0.126;
             hnt_nodes / hnt_pool / hnt_connect_radius: sphere-packing roadmap node budget, candidate
             pool size, and the radius within which nodes are joined by collision-free straight lines;
+            hnt_max_radius: cap on each node's free-sphere radius (0 = uncapped, the paper's literal
+            'maximized free sphere'). Needed on open scenes: uncapped, a 3-obstacle torus saturates at
+            ~78 nodes whose shortest paths are ~1.45x optimal, so T_lb sits above the true travel time
+            at 94% of nodes and the bound loss drags the field upward. At 0.3 rad the packing reaches
+            ~460 nodes and the bounds are tight to within measurement noise;
             hnt_detach_causal: stop-gradient the causality weight. The released TD-NTFields code does
             NOT detach it, but that is safe there because it predicts T directly with a bounded
             quasimetric head; with this repo's T = base/τ, τ→0 makes T→∞ reachable, so an attached
@@ -167,8 +172,9 @@ class Config:
     hnt_lambda_c: float = 0.5
     hnt_dt: float = 0.02
     hnt_nodes: int = 300
-    hnt_pool: int = 6000
+    hnt_pool: int = 40000
     hnt_connect_radius: float = 1.5
+    hnt_max_radius: float = 0.3
     hnt_detach_causal: bool = True
     # mlp backend
     mlp_width: int = 128
