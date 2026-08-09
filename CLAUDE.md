@@ -76,13 +76,17 @@ The original SRM **regression / KAN comparison and physics-informed exploration*
 etc.) predate this line and have been **moved to `_archive/preexisting/`** — they are kept for
 reference but are not part of the active codebase. Restore any by moving it back to the top level.
 
-### Core splat library: `lib/splat.py` (still used)
+### Core splat library: `srms/lib/splat.py` (still used)
 
 - `eval_splat(X, splatnn, rho=None)` — forward pass; `splatnn = (V, A, B)`; `@jax.jit`. Imported by
   `train.py`/`self_supervised.py` (the plane/sphere milestones). `torus.py` uses its own periodic
-  `eval_splat_torus`.
+  `eval_splat_torus`; the `srms/methods/backends/srm.py` backend instead builds on
+  `srms/lib/manifold_splat.py`'s generic `eval_wrapped_gaussian`.
 - `eval_splat_grad`, `gd_splat_regression`, `splat_anim_1d/2d` — analytic-gradient regression and demo
   helpers from the original framework.
+- `srms/lib/manifold_splat.py` — generic wrapped-Gaussian evaluator (`eval_wrapped_gaussian`) plus
+  sphere and SE(2) log-map/Jacobian implementations; moved here (was `lib/`) as part of the
+  ongoing `srms/` reorganization.
 
 ## Data conventions
 

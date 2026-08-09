@@ -1,0 +1,14 @@
+#+title: SRMs for learning time-to-go functions on manifolds
+
+* Running Experiments
+
+** For help
+
+: python -m srms.run --help
+
+** For a 2 dimensional torus with ntfields-style SRM
+
+: python -m srms.run --environment torus --method ntfields --backend srm
+
+Note that this logs stuff using mlflow, but this can be changed to use weights
+and biases or anything else using the "progress_fn" defined in run.py.

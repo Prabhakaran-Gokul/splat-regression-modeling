@@ -2,7 +2,7 @@
 
 This is the first, simplest milestone: an obstacle-free plane or sphere where the
 time-to-go from a fixed source is known analytically. We fit the splat field to
-that ground truth by least squares (reusing ``lib.splat``) to validate that the
+that ground truth by least squares (reusing ``srms.lib.splat``) to validate that the
 splat representation and the visualisation pipeline are correct before moving to
 the self-supervised PDE loss. Output is a single ``[GT | prediction | error]``
 comparison figure with a shared error scale.
@@ -22,7 +22,7 @@ import tyro
 from tqdm import trange
 
 from ground_truth import PlanningProblem, draw_field, make_problem
-from lib.splat import eval_splat
+from srms.lib.splat import eval_splat
 
 
 @dataclasses.dataclass
