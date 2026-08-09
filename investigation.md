@@ -109,6 +109,44 @@ with an **anisotropic Riemannian metric** (`metric_inv → M(θ)⁻¹`) that NTF
 represent — the uncontested part; (2) building it **cheaply from a sparse roadmap + label-free
 self-supervision** (no FMM). Physics = the self-supervision mechanism, not the headline.
 
+**SRM vs MLP on the NTFields lineage — fair head-to-head (2026-08-09, `srms/`).** H-NTFields
+(arXiv 2604.13204, the weak-supervision one) and its own PDE-only ablation, 2-D torus, 4000 steps,
+2048 collocation, identical scene/loss/sampling/optimizer/lr/seed — **the only CLI difference is
+`--backend`**. SRM starts at 64 splats and densifies; MLP is SIREN with Fourier features.
+
+| Baseline | Backend | Params | RMS | max err |
+|---|---|---|---|---|
+| No weak supervision (`--hnt-lambda-r 0`) | SRM adaptive | 2,779 | 0.291 | 3.15 |
+| | MLP w=128 | 33,793 | 0.218 | 1.00 |
+| | MLP w=40 | 3,521 | 0.253 | 0.89 |
+| **H-NTFields (weak supervision)** | **SRM adaptive** | **2,779** | **0.0637** | 0.395 |
+| | MLP w=128 | 33,793 | 0.0667 | 0.343 |
+| | MLP w=40 | 3,521 | 0.0650 | 0.328 |
+
+**Both representations land in the same place.** With weak supervision the three runs agree to within
+5% (0.0637 / 0.0667 / 0.0650) — almost certainly inside seed noise, so *no ordering should be claimed
+from this table without a seed sweep*. Weak supervision helps ~4x on both backends (0.29→0.064,
+0.22→0.067), reproducing H-NTFields' qualitative claim and beating this log's previous best sparse-
+anchor result (0.177, line ~761) by 2.8x. Pure physics reproduces the historical B2/B3 plateau
+(0.291/0.218 here vs 0.331/0.307 then).
+
+**Parameter efficiency is the one real asymmetry.** The SRM matches the 33,793-param MLP at **2,779
+params (12x fewer)**, and the matched-size MLP (3,521) at 21% fewer. Caveat: the SRM's size was
+*schedule*-limited, not chosen — 64 init + 7 densify passes x 48 spawn = 397 splats, never reaching
+`max_splats=512`. A capacity sweep is needed before claiming this is the size it *needs*.
+
+**Open: the SRM's max error.** Pure-physics SRM has max|err| 3.15 vs the MLP's 1.00, but with weak
+supervision the gap nearly closes (0.395 vs 0.343). That pattern fits splat **locality**: where no
+splat has support, `τ≈σ(bias)` so `T≈base`, the free-space geodesic, which under-estimates in obstacle
+shadows — exactly the level (not slope) under-determination this log has documented, and exactly what
+level supervision pins. Not yet localized; do that before treating it as established.
+
+**Fidelity note.** The weak-supervision rows required one adaptation, measured not guessed: uncapped
+sphere-packing saturates at 78 nodes on an open torus whose roadmap paths run 1.45x optimal, so `T_lb`
+sat *above* true travel time at 94% of nodes and training was 6-8x WORSE than PDE-only (RMS 1.49/1.89/
+2.07 — void, do not cite). Capping the free-sphere radius at 0.3 rad gives ~300-460 nodes with paths
+optimal to within FMM grid noise. Applied to the shared scene, so identical for both backends.
+
 **Retired / do-not-repeat:** dense (~300-node) roadmap base scored 0.070 but is *cheating* (dense RRT* is
 impossible in high-D); the screened-Poisson `φ=e^{−T/ε}` route (theory.md §5) was explored but not
 adopted — the direct Eikonal with the NTFields-style factored field won. Antipodal cut-locus sampling
