@@ -20,7 +20,7 @@ import tyro
 from srms.environments import ENVIRONMENTS, sampling
 from srms.methods.backends import BACKENDS
 from srms.methods.strategies import eikonal, hntfields, ntfields, pntfields, weak_supervision
-from srms.viz import render
+from srms.viz import render, render_prediction
 
 STRATEGIES = {
     "eikonal": eikonal,
@@ -36,101 +36,40 @@ _NTFIELDS_FAMILY = ("ntfields", "pntfields", "hntfields")
 
 @dataclasses.dataclass
 class Config:
-    """Configuration for an Eikonal splat solve with obstacles on a chosen manifold.
+    """Configuration for a self-supervised Eikonal solve on a Riemannian manifold.
 
-    Attributes:
-        environment: ``torus`` (flat Tⁿ, e.g. an n-joint revolute arm's configuration space) or
-            ``sphere`` (Sⁿ embedded in R^(n+1)).
-        dim: intrinsic manifold dimension — the ``n`` in Tⁿ / Sⁿ. Training (mesh-free collocation)
-            works at any dim; the dense-grid ground truth (fast marching) and rendering only make
-            sense at dim=2 (a dense grid is intractable and unplottable beyond that) and are skipped
-            for dim>2 — only the final training loss is reported.
-        method: this repo's own methods — ``eikonal`` (free field, BC ring + PDE residual loss) and
-            ``weak_supervision`` (RRT* soft-min base × exp(correction) refinement) — or one of the
-            three published baselines, all sharing the ``T = base/τ`` field so the comparison
-            isolates the objective: ``ntfields`` (isotropic speed loss, arXiv 2210.00120),
-            ``pntfields`` (+ viscosity + progressive speed scheduling, arXiv 2306.00616), or
-            ``hntfields`` (Eikonal + temporal-difference + normal-alignment + sparse-roadmap
-            travel-time bounds, all under a causality weight, arXiv 2604.13204). Each baseline is a
-            *fixed-source* form of a two-point ``T(q_s, q_g)`` paper — see the module
-            docstrings in ``srms/methods/strategies`` for the full deviation list.
-        backend: the function-approximator backend the strategy trains (see
-            ``srms/methods/backends``) — ``srm`` (splat mixture) or ``mlp`` (SIREN-style
-            periodic-activation MLP).
+    Every field below is a scene, method or budget choice; the *why* for each method's own knobs
+    lives in that method's module docstring (``srms/methods/strategies/*.py``) rather than being
+    duplicated here.
 
-        Scene — start: source point (rad joint angles for torus, unit ambient vector for sphere;
-            defaults to a dim-appropriate point if left unset); num_obstacles / obstacle_radius:
-            count and inclusive (min, max) angular radius of the obstacles; slowness_max /
-            slow_width: peak slowness inside obstacles and the ramp width (rad).
+    Groups:
+        manifold — ``environment`` (torus Tⁿ, K=0 and an abelian Lie group; sphere Sⁿ, K=+1;
+            hyperbolic Hⁿ in the Poincaré ball, K=−1; ``so3``, K=¼ and a non-abelian Lie group) and
+            ``dim``, its intrinsic dimension. The SRM backend is identical across all of them: it
+            reads only ``log_map`` / ``jac_factor`` / ``metric_inv`` off the environment, which is the
+            entire per-manifold delta. ``environments/test_manifolds.py`` verifies each against an
+            exact identity before any training runs.
+        method / backend — ``eikonal`` (free field; see its docstring for a known init defect),
+            ``weak_supervision`` (RRT* prior the PDE refines), or the published baselines
+            ``ntfields`` / ``pntfields`` / ``hntfields``, which share the ``T = base/τ`` field so the
+            comparison isolates the objective. ``backend`` is ``srm`` (splat mixture) or ``mlp``.
+        scene — ``start``, ``num_obstacles``, ``obstacle_radius`` (geodesic), ``slowness_max``,
+            ``slow_width``; ``trunc_radius`` bounds the hyperbolic chart (H^d is unbounded).
+        budget — ``steps``, ``lr``, ``num_collocation``, ``seed``, ``resolution`` (scoring grid only).
+        adaptive capacity (``srm``) — the model picks its own size: it grows where the residual is
+            and stops when a densify pass buys less than ``densify_min_gain`` fractional residual
+            reduction *per splat added*. That test is scale-free in both the loss and the spawn
+            schedule, so one threshold transfers across manifolds, seeds and obstacle sets.
+            ``max_splats`` is a runaway backstop, not a target; ``densify_freeze_frac`` settles the
+            basis for the final stretch; ``scale_floor`` is the stabiliser without which a splat
+            collapses onto the Eikonal kink. This is the capability a fixed-width MLP lacks —
+            ``mlp.adapt`` is necessarily a no-op.
 
-        Causal weighting (all strategies) — causal: weight each strategy's residual term
-            source-outward, so a far collocation point is only trusted once nearer points are
-            already well-fit (Wang et al. 2022; ``training_aids.py``); causal_strength: base decay
-            rate scale (divided by num_collocation); causal_anneal: relax the rate to 0 by the end
-            of training.
-
-        Eikonal strategy — source_radius: BC-ring geodesic radius / PDE collocation exclusion
-            radius around the source; n_sphere: number of BC points on that ring; physics_weight:
-            weight on the PDE loss term relative to the boundary-condition loss.
-
-        Weak-supervision strategy (RRT*) — rrt_iters / rrt_step / rrt_radius: RRT* tree size,
-            step, and rewiring radius; roadmap_nodes: base node budget; roadmap_gamma: soft-min
-            temperature; roadmap_hop: samples along each last hop for its slowness weighting;
-            base_reg: pull of the splat correction toward zero (small ⇒ physics leads).
-
-        NTFields strategy — tau_bias: initial sigmoid bias so τ starts near 1 (free space) at
-            init; tau_min: floor of τ = τ_min + (1−τ_min)·σ(g+bias) (0 ⇒ the un-floored paper
-            formulation; >0 is an ablation against the τ→0 runaway). The ntfields/pntfields/
-            hntfields strategies all **ignore ``causal``** — the first two have no such term in
-            their papers, and hntfields carries its own ``L_C`` (``hnt_lambda_c``).
-
-        P-NTFields strategy (adds to the above) — viscosity_eps: ε in 1/S = ‖∇T‖ + ε·Δτ (0 disables,
-            recovering ntfields); alpha_init / alpha_hold_frac / alpha_final: the progressive
-            speed-scheduling curriculum S⋆_α = (1−α) + α·S⋆ — hold at alpha_init for alpha_hold_frac
-            of training, then ramp linearly to alpha_final (paper: 0.5, ~1/4, 1.05).
-
-        H-NTFields strategy — hnt_lambda_e / hnt_lambda_td / hnt_lambda_n / hnt_lambda_r: weights on
-            the Eikonal, temporal-difference, normal-alignment and roadmap-bound terms;
-            hnt_lambda_c: decay in the causality weight exp(−λ_C·T); hnt_dt: the TD step Δt — a
-            configuration-space *displacement*, so it is domain-relative: the paper's 0.02 is ~2% of
-            its unit-span normalized C-space, which on this 2π-span torus corresponds to ≈0.126;
-            hnt_nodes / hnt_pool / hnt_connect_radius: sphere-packing roadmap node budget, candidate
-            pool size, and the radius within which nodes are joined by collision-free straight lines;
-            hnt_max_radius: cap on each node's free-sphere radius (0 = uncapped, the paper's literal
-            'maximized free sphere'). Needed on open scenes: uncapped, a 3-obstacle torus saturates at
-            ~78 nodes whose shortest paths are ~1.45x optimal, so T_lb sits above the true travel time
-            at 94% of nodes and the bound loss drags the field upward. At 0.3 rad the packing reaches
-            ~460 nodes and the bounds are tight to within measurement noise;
-            hnt_detach_causal: stop-gradient the causality weight. The released TD-NTFields code does
-            NOT detach it, but that is safe there because it predicts T directly with a bounded
-            quasimetric head; with this repo's T = base/τ, τ→0 makes T→∞ reachable, so an attached
-            weight pays the optimizer to inflate T and kill its own loss. Measured on the 2-D torus
-            at 800 steps: attached RMS 4.34 / max|err| 170 vs detached 0.63 / 6.4. Defaulted to True
-            for that reason; --no-hnt-detach-causal restores the literal released-code behaviour.
-
-        MLP backend — mlp_width: hidden layer width; mlp_depth: number of hidden layers;
-            mlp_omega0: SIREN frequency scale for the hidden-layer init (Sitzmann et al.).
-
-        SRM backend, adaptive densification — densify: start at init_splats and grow/prune during
-            training instead of using a fixed num_splats mixture (on by default; the fixed model is
-            --no-densify, which then uses num_splats). init_splats / max_splats: starting and maximum
-            splat count; densify_every: steps between grow/prune passes (which stop at 80% of
-            training so the model converges at a fixed structure); spawn_per: splats added per pass,
-            placed at the highest-residual free-space points; prune_thresh: weight below which a
-            splat is dropped; spawn_scale: initial covariance of a spawned splat; scale_floor:
-            minimum covariance singular value — **the** stabilizer, without which a splat collapses
-            to a gradient spike chasing the Eikonal kink and the run diverges.
-            Adaptive densification is the point of the SRM-vs-MLP comparison: the splat model picks
-            its own capacity, so the honest question is not accuracy at a matched budget but how many
-            parameters each representation needs to reach the same field. Every run logs `num_params`
-            to mlflow for exactly that reason.
-
-        Training / output — num_splats, num_collocation, steps, lr, init_scale, resolution
-            (eval + FMM grid, dim=2 only), seed, error_clip (error colour limit),
-            checkpoint_every, log_every (training-metric logging cadence, incl. mlflow), out_dir.
+    Ground truth is computed only *after* training returns (see ``main``); nothing in the training
+    path can reach it, which ``environments/test_selfsupervised.py`` enforces.
     """
 
-    environment: Literal["torus", "sphere"] = "torus"
+    environment: Literal["torus", "sphere", "hyperbolic"] = "torus"
     dim: int = 2
     method: Literal["eikonal", "weak_supervision", "ntfields", "pntfields", "hntfields"] = "eikonal"
     backend: Literal["srm", "mlp"] = "srm"
@@ -140,6 +79,7 @@ class Config:
     obstacle_radius: tuple[float, float] = (0.5, 0.9)
     slowness_max: float = 10.0
     slow_width: float = 0.15
+    trunc_radius: float = 0.9  # hyperbolic only
     # causal weighting (all strategies)
     causal: bool = True
     causal_strength: float = 5.0
@@ -182,9 +122,11 @@ class Config:
     mlp_omega0: float = 30.0
     # srm backend — adaptive densification (3DGS-style grow/prune)
     densify: bool = True
-    init_splats: int = 64
-    max_splats: int = 512
+    init_splats: int = 128
+    max_splats: int = 4096
     densify_every: int = 400
+    densify_min_gain: float = 1e-5
+    densify_freeze_frac: float = 0.1
     spawn_per: int = 48
     prune_thresh: float = 5e-4
     spawn_scale: float = 0.3
@@ -216,6 +158,18 @@ def _build_env(cfg: Config):
             slow_width=cfg.slow_width,
             seed=cfg.seed,
         )
+    if cfg.environment == "hyperbolic":
+        start = cfg.start if cfg.start is not None else (0.0,) * cfg.dim
+        return ENVIRONMENTS["hyperbolic"](
+            start=start,
+            dim=cfg.dim,
+            num_obstacles=cfg.num_obstacles,
+            obstacle_radius=cfg.obstacle_radius,
+            slowness_max=cfg.slowness_max,
+            slow_width=cfg.slow_width,
+            trunc_radius=cfg.trunc_radius,
+            seed=cfg.seed,
+        )
     start = cfg.start if cfg.start is not None else (0.0,) * cfg.dim + (1.0,)
     return ENVIRONMENTS["sphere"](
         start=start,
@@ -229,16 +183,24 @@ def _build_env(cfg: Config):
 
 
 def main(cfg: Config) -> None:
-    """Solve the Eikonal PDE with obstacles and, at dim=2, score against a dense fast-marching grid."""
+    """Solve the Eikonal PDE with obstacles, then score against a dense fast-marching grid.
+
+    **Ground truth is computed only after ``strategy.solve`` returns, and that ordering is the
+    point.** Every method here is self-supervised: the solvers see only the scene (``slowness``,
+    ``sdf``), the analytic base geodesic, and collocation samples. Computing the fast-marching field
+    up front and closing over it — as this function used to, for checkpoint figures — made it
+    *possible in principle* for training to touch it. Deferring it makes that structurally impossible
+    rather than merely true, which is worth more than a comment. ``environments/test_selfsupervised.py``
+    additionally asserts that no strategy module so much as references ``ground_truth``.
+    """
     env = _build_env(cfg)
     backend = BACKENDS[cfg.backend]
-    dense = cfg.dim == 2  # grid ground truth / rendering only tractable at dim=2
+    dense = getattr(env, "has_dense_gt", cfg.dim == 2)  # env decides; 3-D grids are tractable now
 
     thetas = shape = gt = inside = None
     if dense:
         thetas, shape = env.grid(cfg.resolution)
-        gt = env.ground_truth(cfg.resolution)
-        inside = np.asarray(env.sdf(thetas)) < 0.0
+        inside = np.asarray(env.sdf(thetas)) < 0.0  # scene geometry, not ground truth
 
     roadmap = None
     if cfg.method == "weak_supervision":
@@ -250,7 +212,9 @@ def main(cfg: Config) -> None:
         if cfg.method == "weak_supervision":
             nodes, costs = roadmap
             return np.asarray(
-                weak_supervision.predict(backend, current, thetas, nodes, costs, cfg.roadmap_gamma, env, cfg.roadmap_hop)
+                weak_supervision.predict(
+                    backend, current, thetas, nodes, costs, cfg.roadmap_gamma, env, cfg.roadmap_hop
+                )
             )
         if cfg.method in _NTFIELDS_FAMILY:
             return np.asarray(ntfields.predict(backend, current, thetas, env, cfg.tau_bias, cfg.tau_min))
@@ -260,10 +224,19 @@ def main(cfg: Config) -> None:
     if dense:
 
         def checkpoint(current, stepnum: int) -> None:
+            """Mid-training snapshot of the *prediction only*.
+
+            Deliberately GT-free: this callback runs inside the training loop, so anything it can see
+            is something training could in principle be tuned against. It renders the field and
+            reports its range; scoring happens once, after ``solve`` returns.
+            """
             out_name = f"{cfg.environment}_ckpt_{stepnum}.png"
-            marks = render(env, cfg, gt, predict_current(current), inside, shape, out_name=out_name)
-            print(f"  [ckpt {stepnum}] saved {out_name}  RMS={marks['rms']:.4e}", flush=True)
-            mlflow.log_metric("ckpt_rms", marks["rms"], step=stepnum)
+            field = predict_current(current)
+            render_prediction(env, cfg, field, inside, shape, out_name=out_name)
+            print(
+                f"  [ckpt {stepnum}] saved {out_name}  T range [{np.nanmin(field):.3f}, {np.nanmax(field):.3f}]",
+                flush=True,
+            )
 
     run_name = f"{cfg.environment}-{cfg.method}-{cfg.backend}-d{cfg.dim}"
     with mlflow.start_run(run_name=run_name):
@@ -295,12 +268,12 @@ def main(cfg: Config) -> None:
             )
 
         if not dense:
-            print(
-                f"dim={cfg.dim} > 2: no dense-grid ground truth / rendering (intractable past dim=2); training done."
-            )
+            print(f"{cfg.environment} dim={cfg.dim}: no dense-grid ground truth available; training done.")
             print(f"saved {cfg.out_dir}/splat.pkl  ({len(env.obstacles)} obstacles)")
             return
 
+        # ---- scoring: the FIRST point at which ground truth exists in this process -----------------
+        gt = env.ground_truth(cfg.resolution)
         out_name = f"{cfg.environment}_obstacles.png"
         prediction = predict_current(splat)
         metrics = render(env, cfg, gt, prediction, inside, shape, out_name=out_name)
@@ -308,7 +281,10 @@ def main(cfg: Config) -> None:
         mlflow.log_metrics({f"final_{k}": v for k, v in metrics.items()})
         mlflow.log_artifact(f"{cfg.out_dir}/{out_name}")
         print(f"saved {cfg.out_dir}/{out_name}  ({len(env.obstacles)} obstacles)")
-        print(f"RMS={metrics['rms']:.4e}  max|err|={metrics['max_abs']:.4e}  rel_RMS={metrics['rel_rms']:.4e}")
+        print(
+            f"RMS={metrics['rms']:.4e}  max|err|={metrics['max_abs']:.4e}  "
+            f"rel_RMS={metrics['rel_rms']:.4e}  num_params={metrics['num_params']}"
+        )
 
 
 if __name__ == "__main__":

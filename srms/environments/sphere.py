@@ -24,10 +24,13 @@ from __future__ import annotations
 
 import dataclasses
 import heapq
+import math
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+from srms.environments import marching
 
 Obstacle = tuple[float, ...]  # (*centre[dim] unit vector, angular radius)
 
@@ -99,11 +102,16 @@ class SphereEnvironment:
         self.domain: tuple[float, float] = (-1.0, 1.0)
         self.axis_labels: tuple[str, str] = ("ψ longitude (deg)", "θ colatitude (deg)")
         self.render_extent: tuple[float, float, float, float] = (-180.0, 180.0, 0.0, 180.0)
+        self.has_dense_gt = self.n in (2, 3)
         self.obstacles: tuple[Obstacle, ...] = self._sample_obstacles()
 
     @property
     def title(self) -> str:
         return f"sphere S^{self.n} — time-to-go ({self.num_obstacles} obstacles)"
+
+    @property
+    def gt_label(self) -> str:
+        return "ground truth — anisotropic FMM (geodesic-polar grid)"
 
     def _sample_obstacles(self) -> tuple[Obstacle, ...]:
         """Reproducible geodesic-cap obstacles, clear of the source."""
@@ -132,10 +140,37 @@ class SphereEnvironment:
         theta, e_perp = _theta_perp(mu, x)
         return theta * e_perp
 
+    def exp_map(self, mu: jnp.ndarray, v: jnp.ndarray) -> jnp.ndarray:
+        """Exp_mu(v) from tangent-frame coordinates v (size tangent_dim) — inverse of log_map.
+
+        Lifts v through the same Householder frame log_map projects onto, then walks the great
+        circle: cos‖v‖·mu + sin‖v‖·direction. See base.Environment for why this exists.
+        """
+        ambient = _sphere_frame(mu, self.n) @ v
+        norm = jnp.linalg.norm(ambient)
+        direction = ambient / jnp.maximum(norm, 1e-12)
+        return jnp.cos(norm) * mu + jnp.sin(norm) * direction
+
     def jac_factor(self, mu: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
         """|det ∂Log_mu/∂x| = (θ/sinθ)^(n-1), the inverse Riemannian volume element on S^n."""
         theta, _ = _theta_perp(mu, x)
         return (theta / jnp.maximum(jnp.sin(theta), 1e-8)) ** (self.n - 1)
+
+    def splat_precompute(self, mu: jnp.ndarray):
+        """Per-splat geometry: the tangent frame at mu, which the per-point loop must not rebuild.
+
+        ``_sphere_frame`` constructs a [dim, n] Householder matrix and depends only on the splat
+        centre, but evaluating k splats at n points used to build it n*k times instead of k. That was
+        the bulk of the sphere's 8x per-step cost against the flat torus.
+        """
+        return mu, _sphere_frame(mu, self.n)
+
+    def log_and_jac(self, pre, x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """(log_map, jac_factor) sharing one ``_theta_perp`` call instead of two."""
+        mu, frame = pre
+        theta, e_perp = _theta_perp(mu, x)
+        jac = (theta / jnp.maximum(jnp.sin(theta), 1e-8)) ** (self.n - 1)
+        return theta * (e_perp @ frame), jac
 
     def wrap_point(self, x: jnp.ndarray) -> jnp.ndarray:
         """Project back onto the unit sphere (identity if already unit norm)."""
@@ -204,16 +239,26 @@ class SphereEnvironment:
 
     # ---- sampling / ground truth --------------------------------------------
 
+    @property
+    def volume(self) -> float:
+        """Surface area of S^n = 2π^((n+1)/2)/Γ((n+1)/2); the sampler is uniform against it."""
+        return float(2.0 * np.pi ** (self.dim / 2.0) / math.gamma(self.dim / 2.0))
+
     def sample_domain(self, rng: np.random.Generator, n: int) -> np.ndarray:
-        """Uniform samples on S^n (Gaussian direction, normalized)."""
+        """Uniform samples on S^n (Gaussian direction, normalized) — volume-uniform."""
         z = rng.standard_normal((n, self.dim))
         return z / (np.linalg.norm(z, axis=-1, keepdims=True) + 1e-12)
 
     def grid(self, resolution: int) -> tuple[jnp.ndarray, tuple[int, int]]:
         """Lat-long grid (cell-centred colatitude θ x periodic azimuth ψ), fixed to the (0,...,0,1)
         axis; raveled to [resolution², dim=3], plus its (resolution, resolution) shape."""
+        if self.n == 3:
+            polar, shape, _ = marching.polar_grid_3d(resolution, float(np.pi), np.sin)
+            r, u = marching.polar_to_unit3(polar)
+            pts = np.concatenate([np.sin(r)[:, None] * u, np.cos(r)[:, None]], axis=-1)
+            return jnp.asarray(pts, dtype=jnp.float32), shape
         if self.n != 2:
-            raise NotImplementedError("grid()/ground_truth() need a dense lat-long grid — only tractable at n=2")
+            raise NotImplementedError("grid()/ground_truth() need a dense grid — only tractable at n=2,3")
         d_theta = np.pi / resolution
         d_psi = 2.0 * np.pi / resolution
         theta_axis = (np.arange(resolution) + 0.5) * d_theta
@@ -229,6 +274,18 @@ class SphereEnvironment:
         """Fast marching of |∇T| = 1/speed on the S² lat-long grid; returns a raveled array."""
         start = self.start if start is None else start
         points, shape = self.grid(resolution)
+        if self.n == 3:
+            _, _, spacing = marching.polar_grid_3d(resolution, float(np.pi), np.sin)
+            pts = np.asarray(points, dtype=float)
+            seed = np.arccos(np.clip(pts @ np.asarray(start, dtype=float), -1.0, 1.0))
+            return marching.fast_march_3d(
+                spacing=spacing,
+                slowness=np.asarray(self.slowness(points)).reshape(shape),
+                blocked=np.zeros(shape, bool),
+                seed_time=np.where(seed <= 2.0 * np.pi / resolution, seed, np.inf).reshape(shape),
+                periodic=(False, False, True),
+                wrap_fn=marching.polar_topology(shape),
+            ).ravel()
         speed = 1.0 / np.asarray(self.slowness(points)).reshape(shape)
         return _fast_marching_sphere(speed, start, resolution).ravel()
 

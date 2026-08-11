@@ -26,8 +26,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from srms.lib.manifold_splat import eval_wrapped_gaussian
-
 SplatParams = tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]
 
 
@@ -50,38 +48,79 @@ def init_params(key: jax.Array, env, cfg, p: int = 1) -> SplatParams:
 
 
 def eval_raw(params: SplatParams, X: jnp.ndarray, env) -> jnp.ndarray:
-    """Evaluate the raw splat mixture g(x) = Σ_j V[j]·N_w(x | B[j], A[j]) at each row of X. Returns [n, p]."""
+    """Evaluate the raw splat mixture g(x) = Σ_j V[j]·N_w(x | B[j], A[j]) at each row of X. Returns [n, p].
+
+    Centres are read through ``env.wrap_point`` so the density is always evaluated at a centre that
+    lies *on* the manifold — a wrapped Gaussian is undefined otherwise. This makes the loss exactly
+    invariant to ‖B‖, which in turn makes ``dL/dB`` exactly tangent (measured radial component
+    4e-10), so the optimizer only ever moves a centre along the manifold.
+
+    That invariance is necessary but **not sufficient**: with nothing pinning ‖B‖, AdamW's weight
+    decay shrinks it, and the angular step ≈‖ΔB‖/‖B‖ then grows without bound. ``post_step`` performs
+    the actual retraction on the parameters; see its docstring for the measurements.
+
+    A mathematical no-op on the chart manifolds: ``wrap(x − wrap(mu)) ≡ wrap(x − mu)`` on the torus,
+    and hyperbolic's ``_clamp_ball`` is the identity for interior points.
+    """
     V, A, B = params
+    B = env.wrap_point(B)
+    # Per-splat work hoisted out of the per-point loop (see docstring).
+    A_inv = jnp.linalg.inv(A)
+    det_A = jnp.abs(jnp.linalg.det(A))
+    pre = jax.vmap(env.splat_precompute)(B)
+    norm_const = (2.0 * jnp.pi) ** (env.tangent_dim / 2.0)
 
     def rho_at_x(x: jnp.ndarray) -> jnp.ndarray:
-        return jax.vmap(
-            lambda mu, Ak: eval_wrapped_gaussian(
-                x, mu, Ak, log_map_fn=env.log_map, jac_factor_fn=env.jac_factor, dim=env.tangent_dim
-            )
-        )(B, A)
+        def one(pre_j, a_inv, det):
+            # One call for both: jac_factor used to recompute the distance log_map already had.
+            v, jac = env.log_and_jac(pre_j, x)
+            z = a_inv @ v
+            return jnp.exp(-0.5 * jnp.dot(z, z)) / (norm_const * (det + 1e-12)) * jac
+
+        return jax.vmap(one)(pre, A_inv, det_A)
 
     return jax.vmap(rho_at_x)(X) @ V
 
 
-def post_step(params: SplatParams, cfg) -> SplatParams:
-    """Floor each splat's covariance singular values, so no splat can collapse into a gradient spike.
+def post_step(params: SplatParams, cfg, env=None) -> SplatParams:
+    """Floor each splat's covariance singular values, and retract the centres onto the manifold.
 
-    **This is the fix that makes adaptive densification stable.** A sum of Gaussians cannot represent
-    the true Eikonal kink at obstacle boundaries and the cut locus, so unconstrained optimization
-    chases it by driving a splat's covariance to zero — an effectively infinite ``‖∇T‖`` spike (up to
-    ~1e7 was measured) which then blows up any speed-match residual. Flooring the SVD singular values
-    at ``cfg.scale_floor`` makes that collapse impossible. Applied after every optimizer step; jittable,
-    so it lives inside the strategies' ``step``.
+    **Retraction (``env`` given).** A wrapped Gaussian is only defined for a centre lying *on* the
+    manifold, but ``B`` is an unconstrained optimizer variable. This matters only for **embedded**
+    manifolds: on S² ``B`` must satisfy ‖B‖ = 1 and a plain ambient gradient step walks it off —
+    measured 0.105 off the unit sphere by step 65, at which point ``_sphere_frame``'s Householder
+    construction (which assumes a unit vector) is no longer orthonormal and the density goes to NaN.
+    ``env.wrap_point`` is the projection retraction; it agrees with the exponential retraction
+    ``Exp_B`` to O(‖step‖³) (measured 3.3e-4 at step 0.1, 4.3e-7 at 0.01), which is far below float32
+    noise at this learning rate.
 
-    A no-op when ``cfg.scale_floor <= 0``, and irrelevant to the fixed-count model (which never
-    densifies and so never triggers the collapse), but harmless there.
+    Doing it here, on the *parameters*, rather than inside ``eval_raw`` matters. Normalizing at
+    evaluation time makes the loss invariant to ‖B‖, so nothing opposes AdamW's weight decay: ‖B‖ then
+    decays as (1−lr·wd)^step (measured 1.00 → 0.33 over 2400 steps) and, since the angular step on a
+    centre is ≈‖ΔB‖/‖B‖, the effective step size *grows* as the norm shrinks — 3× by step 2400 — and
+    training diverged at step 2481. Retracting the parameters pins ‖B‖ = 1 and removes that coupling.
+
+    A no-op on the chart manifolds: ``wrap`` is idempotent on the torus and hyperbolic's
+    ``_clamp_ball`` is the identity for interior points, so no established result moves.
+
+    **Scale floor — this is the fix that makes adaptive densification stable.** A sum of Gaussians
+    cannot represent the true Eikonal kink at obstacle boundaries and the cut locus, so unconstrained
+    optimization chases it by driving a splat's covariance to zero — an effectively infinite ``‖∇T‖``
+    spike (up to ~1e7 was measured) which then blows up any speed-match residual. Flooring the SVD
+    singular values at ``cfg.scale_floor`` makes that collapse impossible. Applied after every
+    optimizer step; jittable, so it lives inside the strategies' ``step``.
+
+    The floor is a no-op when ``cfg.scale_floor <= 0``, and irrelevant to the fixed-count model
+    (which never densifies and so never triggers the collapse), but harmless there.
     """
-    floor = getattr(cfg, "scale_floor", 0.0)
-    if floor <= 0.0:
-        return params
     V, A, B = params
-    U, S, Vt = jnp.linalg.svd(A)
-    return V, jnp.einsum("kij,kj,kjl->kil", U, jnp.clip(S, floor, None), Vt), B
+    if env is not None:
+        B = env.wrap_point(B)
+    floor = getattr(cfg, "scale_floor", 0.0)
+    if floor > 0.0:
+        U, S, Vt = jnp.linalg.svd(A)
+        A = jnp.einsum("kij,kj,kjl->kil", U, jnp.clip(S, floor, None), Vt)
+    return V, A, B
 
 
 def adapt(params: SplatParams, opt_state, residual_fn, env, cfg, rng: np.random.Generator):

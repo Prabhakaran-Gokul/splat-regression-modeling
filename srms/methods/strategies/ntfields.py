@@ -53,6 +53,7 @@ import numpy as np
 import optax
 from tqdm import trange
 
+from srms.methods.strategies import training_aids
 from srms.methods.strategies.eikonal import sample_collocation
 
 
@@ -108,6 +109,12 @@ def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
 
     ``progress_fn(step, metrics)``, if given, is called every ``cfg.log_every`` steps with a dict of
     scalar training metrics (``loss``, ``eikonal``) — e.g. to log to mlflow (see ``run.py``).
+
+    Two numerical notes. Eq. 4's ``1/√q`` term has a genuine singularity as ``q → 0``, and at
+    ``tau_min=0`` an unfloored ``1/τ`` can blow up on its own, with no obstacle-band gating to damp
+    collocation points that wander near it — hence the clip inside ``isotropic_loss``, matching
+    ``weak_supervision.py`` and this repo's archived PINN scripts for the same loss family. The
+    optimizer is AdamW with weight decay 0.1, following the released implementation.
     """
     if cfg.causal:
         print("[ntfields] paper-faithful: cfg.causal ignored (NTFields has no causal weighting)", flush=True)
@@ -115,10 +122,6 @@ def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
     params = backend.init_params(jax.random.PRNGKey(cfg.seed), env, cfg)
     rng = np.random.default_rng(cfg.seed)
 
-    # Eq. 4's 1/√q term has a genuine singularity as q -> 0 (and, at tau_min=0, an unfloored 1/tau
-    # that can itself blow up) with no obstacle-band gating to damp collocation points that wander
-    # near it. Clip proactively rather than waiting to rediscover the NaN, as weak_supervision.py and
-    # this repo's archived PINN scripts do for the same loss family.
     # AdamW(weight_decay=0.1) matches the released implementation (NTFields models/model_3d.py).
     optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(cfg.lr, weight_decay=0.1))
     opt_state = optimizer.init(params)
@@ -132,18 +135,21 @@ def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
     def step(p, state, colloc, slow):
         (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(p, colloc, slow)
         updates, state = optimizer.update(grads, state, p)
-        return backend.post_step(optax.apply_updates(p, updates), cfg), state, loss, aux
+        return backend.post_step(optax.apply_updates(p, updates), cfg, env), state, loss, aux
 
     def spawn_residual(pts):
         """Where to put new capacity: the Eq. 4 speed mismatch at each candidate centre."""
         return isotropic_loss(speed_ratio(backend, params, pts, env.slowness(pts), env, cfg.tau_bias, cfg.tau_min))
 
+    # The model, not the schedule, decides how many splats it needs (see training_aids).
+    densifier = training_aids.DensifyController(cfg)
     progress = trange(cfg.steps, desc="ntfields")
     for i in progress:
         colloc = sample_collocation(env, rng, cfg.num_collocation, cfg.source_radius)
         slow = env.slowness(colloc)
         params, opt_state, loss, aux = step(params, opt_state, colloc, slow)
-        if cfg.densify and i > 0 and i % cfg.densify_every == 0 and i < 0.8 * cfg.steps:
+        densifier.record(loss)
+        if densifier.should_densify(i, len(params[0])):
             params, opt_state, k = backend.adapt(params, opt_state, spawn_residual, env, cfg, rng)
             if k is not None:
                 progress.write(f"[ntfields] step {i}: densify → {k} splats ({backend.num_params(params)} params)")
@@ -160,5 +166,6 @@ def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
                 )
         if checkpoint is not None and i > 0 and i % cfg.checkpoint_every == 0:
             checkpoint(params, i)
+    print(f"[ntfields] {densifier.summary(len(params[0]) if isinstance(params, tuple) else 0)}", flush=True)
     print(f"[ntfields] final model: {backend.num_params(params)} trainable parameters", flush=True)
     return params

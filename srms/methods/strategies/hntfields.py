@@ -55,6 +55,19 @@ resampling; ``srm``/``mlp`` backend), plus:
   object from ``training_aids.causal_loss`` (Wang et al.'s cumulative-upstream-residual weighting).
   ``L_C`` is implemented inline here and the residual weight is stop-gradient, as weights normally
   are; the paper does not specify.
+- *``L_TD`` follows the released code, not the paper's prose,* since that code produced the
+  published numbers. Three details differ: the step is ``Δt·S⋆·∇T`` rather than the unit-normalized
+  ``u⋆Δt`` (they coincide at convergence, where ``‖∇T‖ = 1/S⋆`` makes the displacement exactly
+  ``Δt``, but differ off-optimum where the code's step shrinks with the gradient); the **whole**
+  target — stepped-point travel time *and* the step's time cost — is computed under ``no_grad``, not
+  just the policy direction; and the term is masked wherever ``T`` is below the step's time cost,
+  i.e. within one step of the source, where stepping would overshoot past it.
+- *``L_C`` is stop-gradient by default (``hnt_detach_causal``).* The released TD-NTFields code does
+  not detach it, which is safe there because it predicts ``T`` directly with a bounded quasimetric
+  head. With this repo's ``T = base/τ``, ``τ→0`` makes ``T→∞`` reachable, so an attached weight pays
+  the optimizer to inflate ``T`` and kill its own loss. Measured on the 2-D torus at 800 steps:
+  attached RMS 4.34 / max|err| 170, detached 0.63 / 6.4. ``--no-hnt-detach-causal`` restores the
+  literal released-code behaviour.
 - *``u⋆`` is stop-gradient.* Differentiating the Taylor expansion through the policy direction would
   bring in second derivatives of ``T``; the paper does not state whether it detaches. Detaching is
   the standard reading of "along the optimal policy".
@@ -79,7 +92,7 @@ import optax
 from tqdm import trange
 
 from srms.environments import sampling
-from srms.methods.strategies import ntfields
+from srms.methods.strategies import ntfields, training_aids
 from srms.methods.strategies.ntfields import predict  # noqa: F401  (re-exported: same T = base/τ field)
 
 
@@ -126,8 +139,7 @@ def speed_star_normal(env, thetas: jnp.ndarray) -> jnp.ndarray:
         return 1.0 / env.slowness(x[None, :])[0]
 
     grad = jax.vmap(jax.grad(s_single))(thetas)
-    # ‖∇S⋆‖ → 0 in flat free space; the (1 − S⋆) weight kills the term there, but 0·NaN is NaN, so
-    # floor the norm rather than let the normalization blow up.
+    # ‖∇S⋆‖ → 0 in free space and 0·NaN is NaN, so floor the norm rather than let it blow up.
     return grad / jnp.maximum(jnp.linalg.norm(grad, axis=1, keepdims=True), 1e-8)
 
 
@@ -148,35 +160,24 @@ def loss_terms(backend, params, thetas, upper, lower, env, cfg):
     q = inv_speed / slow
     l_e = (jnp.sqrt(jnp.clip(q, 1e-12, None)) - 1.0) ** 2
 
-    # L_TD — Bellman over a finite step (Eq. 4), following the released TD-NTFields implementation
-    # (models/metric/model_function_metric.py). Three details there differ from the paper's prose and
-    # are reproduced here, since that code is what produced the published numbers:
-    #   1. The step is `Δt·S⋆·∇T`, not the paper's unit-normalized `u⋆Δt = −∇T/‖∇T‖·Δt`. The two
-    #      coincide at convergence (‖∇T‖ = 1/S⋆ makes the displacement exactly Δt) but differ
-    #      off-optimum, where the code's step shrinks with the gradient instead of staying unit-length.
-    #   2. The **whole target** — the stepped-point travel time *and* the step's time cost — is
-    #      computed under no_grad, not just the policy direction.
-    #   3. The term is masked off wherever T < the step's time cost, i.e. within one step of the
-    #      source, where stepping would overshoot past it.
+    # L_TD — Bellman over a finite step (Eq. 4); three released-code details, see module docstring.
     step_time = cfg.hnt_dt * slow  # Δt/S⋆ — time to cover a Δt-length hop at the local speed
     target = jax.lax.stop_gradient(
         jax.vmap(t_single)(env.wrap_point(thetas - (step_time * s_star**2)[:, None] * grad)) + step_time
     )
     l_td = jnp.where(time < step_time, 0.0, (time - target) ** 2)
 
-    # L_N — align ∇T with the obstacle normal, active only near obstacles (Eq. 5). The released code
-    # weights by (1.001 − S⋆) rather than (1 − S⋆), keeping the weight strictly positive in free space.
+    # L_N — normal alignment (Eq. 5); released code uses (1.001 − S⋆) to stay positive in free space.
     aligned = s_star[:, None] * grad + speed_star_normal(env, thetas)
     l_n = (1.001 - s_star) * jnp.sum(aligned**2, axis=1)
 
     # L_R — hinge onto the roadmap travel-time corridor (Eq. 8).
     l_r = jnp.maximum(0.0, time - upper) + jnp.maximum(0.0, lower - time)
 
-    # L_C — causality: learn small travel times first (Eq. 6). The released code does **not** detach
-    # this weight (`torch.exp(-0.5*T)` multiplies the summed terms with T still in the graph), so it
-    # is left attached here to match. Note this does give the optimizer a degenerate incentive to
-    # inflate T to shrink the weight; L_E and the roadmap bounds are what hold that in check.
-    l_c = jnp.exp(-cfg.hnt_lambda_c * jax.lax.stop_gradient(time) if cfg.hnt_detach_causal else -cfg.hnt_lambda_c * time)
+    # L_C — causality weight (Eq. 6); see the module docstring on hnt_detach_causal.
+    l_c = jnp.exp(
+        -cfg.hnt_lambda_c * jax.lax.stop_gradient(time) if cfg.hnt_detach_causal else -cfg.hnt_lambda_c * time
+    )
     return l_e, l_td, l_n, l_r, l_c
 
 
@@ -200,9 +201,7 @@ def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
 
     def loss_fn(p, thetas, upper, lower):
         l_e, l_td, l_n, l_r, l_c = loss_terms(backend, p, thetas, upper, lower, env, cfg)
-        weighted = (
-            cfg.hnt_lambda_e * l_e + cfg.hnt_lambda_td * l_td + cfg.hnt_lambda_n * l_n + cfg.hnt_lambda_r * l_r
-        )
+        weighted = cfg.hnt_lambda_e * l_e + cfg.hnt_lambda_td * l_td + cfg.hnt_lambda_n * l_n + cfg.hnt_lambda_r * l_r
         total = jnp.mean(weighted * l_c)
         return total, {
             "eikonal": jnp.mean(l_e),
@@ -215,7 +214,7 @@ def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
     def step(p, state, thetas, upper, lower):
         (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(p, thetas, upper, lower)
         updates, state = optimizer.update(grads, state, p)
-        return backend.post_step(optax.apply_updates(p, updates), cfg), state, loss, aux
+        return backend.post_step(optax.apply_updates(p, updates), cfg, env), state, loss, aux
 
     def spawn_residual(pts):
         """Where to put new capacity: the genuine speed mismatch (√q − 1)², i.e. the L_E term alone."""
@@ -223,12 +222,15 @@ def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
         q = ntfields.grad_norm(grad, pts, env) * speed_star(env, pts)
         return (jnp.sqrt(jnp.clip(q, 1e-12, None)) - 1.0) ** 2
 
+    # The model, not the schedule, decides how many splats it needs (see training_aids).
+    densifier = training_aids.DensifyController(cfg)
     progress = trange(cfg.steps, desc="hntfields")
     for i in progress:
         thetas, upper, lower = sample_perturbed(env, nodes, radii, times, rng, cfg.num_collocation)
         params, opt_state, loss, aux = step(params, opt_state, thetas, upper, lower)
-        # Densify in the first 80% of training, so the final stretch converges at a fixed structure.
-        if cfg.densify and i > 0 and i % cfg.densify_every == 0 and i < 0.8 * cfg.steps:
+        # The model picks its own size by marginal value (training_aids.DensifyController).
+        densifier.record(loss)
+        if densifier.should_densify(i, len(params[0])):
             params, opt_state, k = backend.adapt(params, opt_state, spawn_residual, env, cfg, rng)
             if k is not None:
                 progress.write(f"[hntfields] step {i}: densify → {k} splats ({backend.num_params(params)} params)")
@@ -242,5 +244,6 @@ def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
                 )
         if checkpoint is not None and i > 0 and i % cfg.checkpoint_every == 0:
             checkpoint(params, i)
+    print(f"[hntfields] {densifier.summary(len(params[0]) if isinstance(params, tuple) else 0)}", flush=True)
     print(f"[hntfields] final model: {backend.num_params(params)} trainable parameters", flush=True)
     return params

@@ -12,3 +12,51 @@
 
 Note that this logs stuff using mlflow, but this can be changed to use weights
 and biases or anything else using the "progress_fn" defined in run.py.
+
+** Reproducing the 2D manifold results
+
+All six runs share one configuration; only ~--environment~ and ~--method~ vary.
+
+#+begin_src sh
+COMMON="--backend srm --tau_min 0.01 --init_splats 128 --spawn_per 128 --densify_every 200 \
+        --max_splats 50000 --densify_min_gain 1e-5 --densify_freeze_frac 0.1 \
+        --steps 4000 --resolution 240 --seed 1"
+
+for env in torus sphere hyperbolic; do
+  python -m srms.run --environment $env --method ntfields  $COMMON --out_dir figures/manifolds/final_$env
+  python -m srms.run --environment $env --method hntfields $COMMON --out_dir figures/manifolds/weak_$env
+done
+
+python make_tables.py > results/tables.tex
+#+end_src
+
+~ntfields~ is the no-weak-supervision arm (PDE residual only); ~hntfields~ adds sparse-roadmap
+travel-time bounds. Runs share no state, so run them concurrently if cores allow.
+
+~make_tables.py~ emits the two LaTeX tables, recomputed from each run's saved ~splat.pkl~. It refuses
+to emit unless all six runs exist and their configs match on every field except ~environment~,
+~method~, ~out_dir~, ~start~ and ~dim~.
+
+The splat count is chosen by the model, not set: capacity grows where the residual is and stops when
+a densify pass buys less than ~densify_min_gain~ fractional residual reduction per splat added, on
+two consecutive passes.
+
+** Verifying before trusting a number
+
+#+begin_src sh
+python -m srms.environments.test_manifolds        # exact geometry identities, per manifold
+python -m srms.environments.test_selfsupervised   # no training path can reach ground truth
+#+end_src
+
+The first checks ~Exp(Log(x)) == x~, ~||Log|| == geodesic~, ~jac_factor~ against autodiff, and
+~||grad d||_g == 1~ — no ground truth, no training, so a wrong curvature term fails there rather than
+surfacing later as a mediocre RMS. The second checks statically, by interface, and by running each
+strategy with ~env.ground_truth~ replaced by a trap that raises.
+
+** Figures
+
+#+begin_src sh
+python manifold_figure.py --method ntfields --load figures/manifolds
+#+end_src
+
+~--load~ renders from the saved models, so the figure always shows the same fit the metrics describe.

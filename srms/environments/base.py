@@ -49,6 +49,17 @@ class Environment(Protocol):
         """
         ...
 
+    def exp_map(self, mu: jnp.ndarray, v: jnp.ndarray) -> jnp.ndarray:
+        """Exp_mu(v): the inverse of ``log_map``, taking tangent-frame coordinates back to a point.
+
+        Not used by training — it exists so the manifold plumbing is *falsifiable*:
+        ``exp_map(mu, log_map(mu, x)) == x`` and ``‖log_map(mu, x)‖ == geodesic(x, mu)`` are exact
+        identities with no ground truth, no solver and no tuning behind them. See
+        ``environments/test_manifolds.py``, which also checks ``jac_factor`` against autodiff and
+        ``metric_inv`` against ``‖∇ geodesic‖_g == 1``.
+        """
+        ...
+
     def jac_factor(self, mu: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
         """|det d(log_map)/dx| Riemannian-volume correction; 1.0 for flat manifolds."""
         ...

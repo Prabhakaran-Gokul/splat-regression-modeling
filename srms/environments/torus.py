@@ -57,11 +57,16 @@ class TorusEnvironment:
         self.domain: tuple[float, float] = (-float(np.pi), float(np.pi))
         self.axis_labels: tuple[str, str] = ("θ1 (deg)", "θ2 (deg)")
         self.render_extent: tuple[float, float, float, float] = (-180.0, 180.0, -180.0, 180.0)
+        self.has_dense_gt = self.dim in (2, 3)  # dense fast marching tractable at 2-D and 3-D
         self.obstacles: tuple[Obstacle, ...] = self._sample_obstacles()
 
     @property
     def title(self) -> str:
         return f"torus T^{self.dim} — time-to-go ({self.num_obstacles} obstacles)"
+
+    @property
+    def gt_label(self) -> str:
+        return "ground truth — periodic FMM (flat chart)"
 
     def _sample_obstacles(self) -> tuple[Obstacle, ...]:
         """Reproducible spherical obstacles in angle space, clear of the source."""
@@ -85,9 +90,21 @@ class TorusEnvironment:
         """Flat torus: identical to log_map (ambient chart coincides with the tangent frame)."""
         return wrap(x - mu)
 
+    def exp_map(self, mu: jnp.ndarray, v: jnp.ndarray) -> jnp.ndarray:
+        """Exp_mu(v) = wrap(mu + v) — inverse of log_map on the flat torus (see base.Environment)."""
+        return wrap(mu + v)
+
     def jac_factor(self, mu: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
         """Flat torus: trivial volume element."""
         return jnp.asarray(1.0)
+
+    def splat_precompute(self, mu: jnp.ndarray):
+        """Per-splat geometry hoisted out of the per-point loop; nothing to precompute here."""
+        return mu
+
+    def log_and_jac(self, pre, x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """(log_map, jac_factor) in one call — see base.Environment for why they are fused."""
+        return wrap(x - pre), jnp.asarray(1.0)
 
     def wrap_point(self, x: jnp.ndarray) -> jnp.ndarray:
         return wrap(x)
@@ -117,9 +134,7 @@ class TorusEnvironment:
 
     def sdf(self, thetas: jnp.ndarray) -> jnp.ndarray:
         """Signed distance (wrapped) to the union of obstacle balls."""
-        per = [
-            jnp.linalg.norm(wrap(thetas - jnp.array(obs[:-1])), axis=-1) - obs[-1] for obs in self.obstacles
-        ]
+        per = [jnp.linalg.norm(wrap(thetas - jnp.array(obs[:-1])), axis=-1) - obs[-1] for obs in self.obstacles]
         return jnp.min(jnp.stack(per, axis=0), axis=0)
 
     def slowness(self, thetas: jnp.ndarray) -> jnp.ndarray:
@@ -140,25 +155,48 @@ class TorusEnvironment:
 
     # ---- sampling / ground truth --------------------------------------------
 
+    @property
+    def volume(self) -> float:
+        """Riemannian volume of the region ``sample_domain`` covers — flat, so just the chart box."""
+        return float((2.0 * np.pi) ** self.dim)
+
     def sample_domain(self, rng: np.random.Generator, n: int) -> np.ndarray:
-        """Uniform samples in [-π, π)^dim."""
+        """Uniform samples in [-π, π)^dim — volume-uniform, since the torus is flat."""
         return rng.uniform(-np.pi, np.pi, size=(n, self.dim))
 
-    def grid(self, resolution: int) -> tuple[jnp.ndarray, tuple[int, int]]:
-        """Grid of θ over [-π, π)², raveled to [resolution², 2], plus its (resolution, resolution) shape."""
-        if self.dim != 2:
-            raise NotImplementedError("grid()/ground_truth() need a dense grid — only tractable at dim=2")
+    def grid(self, resolution: int) -> tuple[jnp.ndarray, tuple[int, ...]]:
+        """Periodic grid of θ over [-π, π)^dim, raveled to [resolution^dim, dim], plus its shape.
+
+        Tractable at dim 2 and 3 (resolution³ cells); beyond that a dense grid is hopeless and
+        training remains mesh-free.
+        """
+        if self.dim not in (2, 3):
+            raise NotImplementedError("grid()/ground_truth() need a dense grid — only tractable at dim<=3")
         axis = np.linspace(-np.pi, np.pi, resolution, endpoint=False)
-        grid1, grid2 = np.meshgrid(axis, axis)
-        thetas_np = np.stack([grid1.ravel(), grid2.ravel()], axis=-1)
-        return jnp.asarray(thetas_np, dtype=jnp.float32), (resolution, resolution)
+        mesh = np.meshgrid(*([axis] * self.dim), indexing="ij" if self.dim == 3 else "xy")
+        thetas_np = np.stack([m.ravel() for m in mesh], axis=-1)
+        return jnp.asarray(thetas_np, dtype=jnp.float32), (resolution,) * self.dim
 
     def ground_truth(self, resolution: int, start: tuple[float, ...] | None = None) -> np.ndarray:
-        """Periodic fast marching of |∇T| = 1/speed on the flat-torus grid; returns a raveled array."""
+        """Periodic fast marching of ‖∇T‖ = slowness on the flat-torus grid; returns a raveled array."""
         start = self.start if start is None else start
         thetas, shape = self.grid(resolution)
-        speed = 1.0 / np.asarray(self.slowness(thetas)).reshape(shape)
-        return _fast_marching_torus(speed, start, resolution).ravel()
+        if self.dim == 2:
+            speed = 1.0 / np.asarray(self.slowness(thetas)).reshape(shape)
+            return _fast_marching_torus(speed, start, resolution).ravel()
+        # dim == 3: the shared anisotropic marcher, with uniform spacing and all axes periodic
+        from srms.environments.marching import fast_march_3d
+
+        step = 2 * np.pi / resolution
+        pts = np.asarray(thetas, dtype=float)
+        seed = np.linalg.norm(_wrap_np(pts - np.asarray(start)), axis=-1).reshape(shape)
+        return fast_march_3d(
+            spacing=np.full(shape + (3,), step),
+            slowness=np.asarray(self.slowness(thetas)).reshape(shape),
+            blocked=np.zeros(shape, bool),
+            seed_time=np.where(seed <= 1.5 * step, seed, np.inf),
+            periodic=(True, True, True),
+        ).ravel()
 
     def render_marker_deg(self) -> tuple[float, float]:
         """(θ1, θ2) position of the source in degrees (only meaningful at dim=2)."""

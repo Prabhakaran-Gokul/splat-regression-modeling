@@ -65,11 +65,12 @@ def eval_raw(params: MLPParams, X: jnp.ndarray, env) -> jnp.ndarray:
     return h @ W_out + b_out
 
 
-def post_step(params: MLPParams, cfg) -> MLPParams:
-    """No-op: an MLP has no per-unit scale that can collapse, so there is nothing to project.
+def post_step(params: MLPParams, cfg, env=None) -> MLPParams:
+    """No-op: an MLP has no per-unit scale that can collapse, and no parameter that must lie on the
+    manifold, so there is nothing to project or retract.
 
     Present so the strategies can call ``backend.post_step`` unconditionally (see
-    ``srms/methods/backends/srm.py``, where it floors splat covariances).
+    ``srms/methods/backends/srm.py``, where it floors splat covariances and retracts splat centres).
     """
     return params
 

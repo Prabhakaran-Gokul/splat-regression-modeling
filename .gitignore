@@ -11,3 +11,6 @@ logs
 *.png
 validation.md
 mlflow.db
+figures/
+results/
+mlartifacts/
