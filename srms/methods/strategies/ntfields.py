@@ -135,7 +135,8 @@ def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
     def step(p, state, colloc, slow):
         (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(p, colloc, slow)
         updates, state = optimizer.update(grads, state, p)
-        return backend.post_step(optax.apply_updates(p, updates), cfg, env), state, loss, aux
+        p = backend.post_step(optax.apply_updates(p, updates), cfg, env)
+        return p, state, loss, aux
 
     def spawn_residual(pts):
         """Where to put new capacity: the Eq. 4 speed mismatch at each candidate centre."""

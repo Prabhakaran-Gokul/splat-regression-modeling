@@ -138,7 +138,7 @@ def _distance_np(x: np.ndarray, y: np.ndarray) -> np.ndarray:
 
 
 @dataclasses.dataclass
-class HyperbolicEnvironment:
+class PoincareHyperbolicEnvironment:
     """H^d in the Poincaré ball with a smooth slowness field rising around geodesic balls."""
 
     start: tuple[float, ...] = (0.0, 0.0)

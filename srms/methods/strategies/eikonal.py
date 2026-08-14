@@ -82,7 +82,8 @@ def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
     def step(p, state, colloc, slow, rate):
         (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(p, colloc, slow, rate)
         updates, state = optimizer.update(grads, state, p)
-        return optax.apply_updates(p, updates), state, loss, aux
+        p = backend.post_step(optax.apply_updates(p, updates), cfg, env)
+        return p, state, loss, aux
 
     progress = trange(cfg.steps, desc="eikonal")
     for i in progress:

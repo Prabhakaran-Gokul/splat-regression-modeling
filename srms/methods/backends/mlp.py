@@ -1,6 +1,6 @@
 """MLP backend: a SIREN-style multi-layer perceptron with periodic (sin) activations.
 
-Alternative to ``srms/methods/backends/srm.py``'s splat mixture — same two entry
+Alternative to ``srms/methods/backends/srm.py``'s splat mixture — same three entry
 points so a training strategy (``srms/methods/strategies``) never needs to know
 which one it's using:
 
@@ -8,6 +8,8 @@ which one it's using:
   ``cfg.mlp_depth``, ``cfg.mlp_omega0``; other backends read their own fields
   off the same flat ``cfg``.
 - ``eval_raw(params, X, env) -> [n, p]`` — the raw (unfactored) field value.
+- ``post_step(params, cfg, env) -> params`` — identity here (no manifold-embedded
+  parameters to reproject; see ``srm.py``'s version for why other backends need it).
 
 Two departures from a vanilla MLP, both aimed at the periodic domains this
 repo targets (torus / robot-arm joint angles):

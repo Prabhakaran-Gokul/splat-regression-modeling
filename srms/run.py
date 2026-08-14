@@ -44,11 +44,12 @@ class Config:
 
     Groups:
         manifold — ``environment`` (torus Tⁿ, K=0 and an abelian Lie group; sphere Sⁿ, K=+1;
-            hyperbolic Hⁿ in the Poincaré ball, K=−1; ``so3``, K=¼ and a non-abelian Lie group) and
-            ``dim``, its intrinsic dimension. The SRM backend is identical across all of them: it
-            reads only ``log_map`` / ``jac_factor`` / ``metric_inv`` off the environment, which is the
-            entire per-manifold delta. ``environments/test_manifolds.py`` verifies each against an
-            exact identity before any training runs.
+            hyperbolic Hⁿ in the Poincaré ball or Lorentz Model, K=−1; ``so3``, K=¼ and a
+            non-abelian Lie group) and ``dim``, its intrinsic dimension. The SRM backend is
+            identical across all of them: it reads only ``log_map`` / ``jac_factor`` /
+            ``metric_inv`` off the environment, which is the entire per-manifold
+            delta. ``environments/test_manifolds.py`` verifies each against an exact identity before
+            any training runs.
         method / backend — ``eikonal`` (free field; see its docstring for a known init defect),
             ``weak_supervision`` (RRT* prior the PDE refines), or the published baselines
             ``ntfields`` / ``pntfields`` / ``hntfields``, which share the ``T = base/τ`` field so the
@@ -67,9 +68,10 @@ class Config:
 
     Ground truth is computed only *after* training returns (see ``main``); nothing in the training
     path can reach it, which ``environments/test_selfsupervised.py`` enforces.
+
     """
 
-    environment: Literal["torus", "sphere", "hyperbolic"] = "torus"
+    environment: Literal["torus", "sphere", "poincare_hyperbolic", "lorentz_hyperbolic"] = "torus"
     dim: int = 2
     method: Literal["eikonal", "weak_supervision", "ntfields", "pntfields", "hntfields"] = "eikonal"
     backend: Literal["srm", "mlp"] = "srm"
@@ -80,6 +82,8 @@ class Config:
     slowness_max: float = 10.0
     slow_width: float = 0.15
     trunc_radius: float = 0.9  # hyperbolic only
+    ray_length: tuple[float, float] = (0.8, 1.8)  # lorentz hyperbolic only
+    ray_thickness: tuple[float, float] = (0.08, 0.15)  # lorentz hyperbolic only
     # causal weighting (all strategies)
     causal: bool = True
     causal_strength: float = 5.0
@@ -158,9 +162,9 @@ def _build_env(cfg: Config):
             slow_width=cfg.slow_width,
             seed=cfg.seed,
         )
-    if cfg.environment == "hyperbolic":
+    if cfg.environment == "poincare_hyperbolic":
         start = cfg.start if cfg.start is not None else (0.0,) * cfg.dim
-        return ENVIRONMENTS["hyperbolic"](
+        return ENVIRONMENTS["poincare_hyperbolic"](
             start=start,
             dim=cfg.dim,
             num_obstacles=cfg.num_obstacles,
@@ -170,16 +174,30 @@ def _build_env(cfg: Config):
             trunc_radius=cfg.trunc_radius,
             seed=cfg.seed,
         )
-    start = cfg.start if cfg.start is not None else (0.0,) * cfg.dim + (1.0,)
-    return ENVIRONMENTS["sphere"](
-        start=start,
-        n=cfg.dim,
-        num_obstacles=cfg.num_obstacles,
-        obstacle_radius=cfg.obstacle_radius,
-        slowness_max=cfg.slowness_max,
-        slow_width=cfg.slow_width,
-        seed=cfg.seed,
-    )
+    if cfg.environment == "lorentz_hyperbolic":
+        start = cfg.start if cfg.start is not None else (0.0,) * cfg.dim + (1.0,)
+        return ENVIRONMENTS["lorentz_hyperbolic"](
+            start=start,  # apex (0,...,0,1) also satisfies H^n's <x,x>_eta=-1, same default as sphere
+            n=cfg.dim,
+            domain_radius=cfg.trunc_radius,
+            num_obstacles=cfg.num_obstacles,
+            ray_length=cfg.ray_length,
+            ray_thickness=cfg.ray_thickness,
+            slowness_max=cfg.slowness_max,
+            slow_width=cfg.slow_width,
+            seed=cfg.seed,
+        )
+    if cfg.environment == "sphere":
+        start = cfg.start if cfg.start is not None else (0.0,) * cfg.dim + (1.0,)
+        return ENVIRONMENTS["sphere"](
+            start=start,
+            n=cfg.dim,
+            num_obstacles=cfg.num_obstacles,
+            obstacle_radius=cfg.obstacle_radius,
+            slowness_max=cfg.slowness_max,
+            slow_width=cfg.slow_width,
+            seed=cfg.seed,
+        )
 
 
 def main(cfg: Config) -> None:
@@ -197,10 +215,18 @@ def main(cfg: Config) -> None:
     backend = BACKENDS[cfg.backend]
     dense = getattr(env, "has_dense_gt", cfg.dim == 2)  # env decides; 3-D grids are tractable now
 
-    thetas = shape = gt = inside = None
+    thetas = shape = gt = inside = coords = edges = None
     if dense:
         thetas, shape = env.grid(cfg.resolution)
-        inside = np.asarray(env.sdf(thetas)) < 0.0  # scene geometry, not ground truth
+        gt = env.ground_truth(cfg.resolution)
+        inside = np.asarray(env.sdf(thetas)) < 0.0
+        # duck-typed: only environments with a curvilinear chart (e.g. PoincareHyperbolicEnvironment's
+        # Poincaré disk) define render_grid_xy/render_grid_edges_xy; torus/sphere fall back to
+        # viz.render's default rectangular imshow(extent=...) path (coords=edges=None)
+        if hasattr(env, "render_grid_xy"):
+            coords = env.render_grid_xy(cfg.resolution)
+        if hasattr(env, "render_grid_edges_xy"):
+            edges = env.render_grid_edges_xy(cfg.resolution)
 
     roadmap = None
     if cfg.method == "weak_supervision":
@@ -237,6 +263,7 @@ def main(cfg: Config) -> None:
                 f"  [ckpt {stepnum}] saved {out_name}  T range [{np.nanmin(field):.3f}, {np.nanmax(field):.3f}]",
                 flush=True,
             )
+
 
     run_name = f"{cfg.environment}-{cfg.method}-{cfg.backend}-d{cfg.dim}"
     with mlflow.start_run(run_name=run_name):
@@ -276,7 +303,7 @@ def main(cfg: Config) -> None:
         gt = env.ground_truth(cfg.resolution)
         out_name = f"{cfg.environment}_obstacles.png"
         prediction = predict_current(splat)
-        metrics = render(env, cfg, gt, prediction, inside, shape, out_name=out_name)
+        metrics = render(env, cfg, gt, prediction, inside, shape, out_name=out_name, coords=coords, edges=edges)
         metrics["num_params"] = backend.num_params(splat)  # so srm/mlp are comparable at equal accuracy
         mlflow.log_metrics({f"final_{k}": v for k, v in metrics.items()})
         mlflow.log_artifact(f"{cfg.out_dir}/{out_name}")

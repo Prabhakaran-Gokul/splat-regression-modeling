@@ -6,6 +6,53 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
+def _draw_field(
+    ax,
+    env,
+    img: np.ndarray,
+    shape: tuple[int, int],
+    coords: tuple[np.ndarray, np.ndarray] | None,
+    edges: tuple[np.ndarray, np.ndarray] | None,
+    cmap: str,
+    vmin: float,
+    vmax: float,
+):
+    """Draw ``img`` (shape ``shape``) on ``ax`` over ``env``'s chart; returns ``(handle, mesh1,
+    mesh2)`` (the last two for ``contour``, which needs cell-*centre* coordinates matching
+    ``img``'s shape regardless of which branch below is taken).
+
+    ``coords``, if given, is a pair of 2D (X, Y) curvilinear cell-centre coordinate arrays
+    matching ``shape`` (e.g. ``HyperbolicEnvironment.render_grid_xy``'s Poincaré-disk
+    coordinates): drawn via ``pcolormesh`` + a unit-circle boundary instead of
+    ``imshow(extent=...)``, since a curvilinear chart isn't a rectangle in its own coordinates.
+    ``edges``, if given, is the same chart's cell-*edge* coordinates
+    ((shape[0]+1, shape[1]+1); e.g. ``render_grid_edges_xy``) for ``pcolormesh`` specifically —
+    ``pcolormesh``'s own centre-to-edge inference (``shading="auto"``) silently breaks on a
+    periodic chart at the wraparound seam, so a curvilinear environment should supply real edges;
+    without them this falls back to plotting the centres with ``shading="auto"`` regardless.
+    torus/sphere never pass either (callers only do for environments that define
+    ``render_grid_xy``/``render_grid_edges_xy``).
+    """
+    if coords is None:
+        extent = env.render_extent
+        mesh1, mesh2 = np.meshgrid(
+            np.linspace(extent[0], extent[1], shape[1]), np.linspace(extent[2], extent[3], shape[0])
+        )
+        handle = ax.imshow(img, origin="lower", extent=extent, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto")
+        return handle, mesh1, mesh2
+
+    mesh1, mesh2 = coords
+    if edges is None:
+        handle = ax.pcolormesh(mesh1, mesh2, img, shading="auto", cmap=cmap, vmin=vmin, vmax=vmax)
+    else:
+        handle = ax.pcolormesh(edges[0], edges[1], img, shading="flat", cmap=cmap, vmin=vmin, vmax=vmax)
+    ax.add_patch(plt.Circle((0.0, 0.0), 1.0, fill=False, edgecolor="black", linewidth=1.0))
+    ax.set_xlim(-1.05, 1.05)
+    ax.set_ylim(-1.05, 1.05)
+    ax.set_aspect("equal")
+    return handle, mesh1, mesh2
+
+
 def render(
     env,
     cfg,
@@ -14,8 +61,11 @@ def render(
     inside: np.ndarray,
     shape: tuple[int, int],
     out_name: str = "torus_obstacles.png",
+    coords: tuple[np.ndarray, np.ndarray] | None = None,
+    edges: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> dict:
-    """Save a [GT | prediction | error] figure over the environment's chart and return metrics."""
+    """Save a [GT | prediction | error] figure over the environment's chart and return metrics.
+    See ``_draw_field`` for what ``coords``/``edges`` do."""
     extent = env.render_extent
     marker = env.render_marker_deg()
     gt_img = np.where(inside, np.nan, gt).reshape(shape)
@@ -34,7 +84,7 @@ def render(
     ]
     for ax, (title, img, cmap, lo, hi, levels) in zip(axes, panels):
         ax.set_facecolor("lightgray")
-        handle = ax.imshow(img, origin="lower", extent=extent, cmap=cmap, vmin=lo, vmax=hi, aspect="auto")
+        handle, mesh1, mesh2 = _draw_field(ax, env, img, shape, coords, edges, cmap, lo, hi)
         if levels:
             ax.contour(mesh1, mesh2, img, levels=levels, colors="white", linewidths=0.6, alpha=0.7)
         ax.contour(mesh1, mesh2, blocked, levels=[0.5], colors="black", linewidths=1.2)
@@ -91,4 +141,39 @@ def render_prediction(env, cfg, prediction, inside, shape, out_name="prediction.
     fig.colorbar(handle, ax=ax, fraction=0.046, pad=0.04)
     fig.tight_layout()
     fig.savefig(f"{cfg.out_dir}/{out_name}", dpi=130)
+    plt.close(fig)
+
+
+def plot_speed_field(env, resolution: int, out_path: str) -> None:
+    """Save a standalone visualization of the speed field s(x) = 1/slowness(x) over env's domain,
+    with obstacle boundaries and the source marked — no training or prediction involved, purely
+    the scene definition (``env.slowness``/``env.sdf``). Useful for sanity-checking a scene
+    (obstacle placement, ``slowness_max``/``slow_width`` scale) before spending a training budget
+    on it. Uses the same curvilinear-chart dispatch as ``render()`` (see ``_draw_field``):
+    environments with ``render_grid_xy``/``render_grid_edges_xy`` (e.g.
+    ``HyperbolicEnvironment``'s Poincaré disk) get a ``pcolormesh`` + unit-circle boundary; others
+    (torus, sphere) fall back to ``imshow(extent=env.render_extent)``. Only meaningful at dim=2,
+    same restriction as ``env.grid()`` itself (raises ``NotImplementedError`` otherwise).
+    """
+    points, shape = env.grid(resolution)
+    speed = (1.0 / np.asarray(env.slowness(points))).reshape(shape)
+    inside = np.asarray(env.sdf(points)).reshape(shape) < 0.0
+    speed_img = np.where(inside, np.nan, speed)
+    blocked = inside.astype(float)
+    marker = env.render_marker_deg()
+
+    coords = env.render_grid_xy(resolution) if hasattr(env, "render_grid_xy") else None
+    edges = env.render_grid_edges_xy(resolution) if hasattr(env, "render_grid_edges_xy") else None
+
+    fig, ax = plt.subplots(figsize=(7.5, 7))
+    ax.set_facecolor("lightgray")
+    handle, mesh1, mesh2 = _draw_field(ax, env, speed_img, shape, coords, edges, "viridis", 0.0, 1.0)
+    ax.contour(mesh1, mesh2, blocked, levels=[0.5], colors="black", linewidths=1.4)
+    ax.plot(*marker, "*", color="red", markersize=16, markeredgecolor="white")
+    ax.set_xlabel(env.axis_labels[0])
+    ax.set_ylabel(env.axis_labels[1])
+    ax.set_title(f"{env.title} — speed field s(x) = 1/slowness(x)")
+    fig.colorbar(handle, ax=ax, fraction=0.046, pad=0.04, label="speed (1 = free space)")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
     plt.close(fig)

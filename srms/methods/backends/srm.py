@@ -10,7 +10,7 @@ that math with the wrap baked in by name.
 Parameters ``(V, A, B)``: ``V: [k, p]`` weights, ``A: [k, d, d]`` scale/rotation,
 ``B: [k, d]`` centres — same convention as ``srms/lib/splat.py``.
 
-Every backend (this one, and eventually ``mlp``/``kan``) exposes the same two
+Every backend (this one, and eventually ``mlp``/``kan``) exposes the same three
 entry points so a training strategy (``srms/methods/strategies``) never needs
 to know which one it's using:
 
@@ -18,6 +18,8 @@ to know which one it's using:
   needs (here: ``cfg.num_splats``, ``cfg.init_scale``); other backends read
   their own fields off the same flat ``cfg``.
 - ``eval_raw(params, X, env) -> [n, p]`` — the raw (unfactored) field value.
+- ``post_step(params, cfg, env) -> params`` — called by every strategy's
+  training loop after each optimizer step (see ``post_step`` below for why).
 """
 
 from __future__ import annotations
