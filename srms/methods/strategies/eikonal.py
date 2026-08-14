@@ -69,7 +69,10 @@ def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
     rng = np.random.default_rng(cfg.seed)
     src_pts, src_vals = source_sphere(env, cfg.source_radius, cfg.n_sphere, cfg.seed)
 
-    optimizer = optax.adam(cfg.lr)
+    # A stray large step can still blow the gradient up and NaN the run (same "srm backend" risk
+    # ntfields.py/weak_supervision.py already clip against — see their docstrings); this strategy
+    # was the one holdout without it.
+    optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(cfg.lr))
     opt_state = optimizer.init(params)
 
     def loss_fn(p, colloc, slow, rate):
