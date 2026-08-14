@@ -36,14 +36,23 @@ from __future__ import annotations
 
 import dataclasses
 import heapq
+import math
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-Obstacle = tuple[float, ...]  # (*origin[dim], *direction[dim], length, thickness) — a capsule-
+BallObstacle = tuple[float, ...]  # (*centre[dim], radius) — a geodesic ball, the same primitive
+# torus/sphere/so3/PoincareHyperbolicEnvironment use.
+RayObstacle = tuple[float, ...]  # (*origin[dim], *direction[dim], length, thickness) — a capsule-
 # thickened geodesic ray: {cosh(t)*origin + sinh(t)*direction : t in [0, length]}, direction an
 # eta-unit tangent vector at origin.
+Obstacle = BallObstacle | RayObstacle
+
+# Matches PoincareHyperbolicEnvironment's default wall_distance = 2*artanh(trunc_radius=0.9): the two
+# hyperbolic environments' default scenes then have literally the same geodesic domain radius, and
+# (bonus identity, not a coincidence) render_grid_xy's Poincaré-disk outer ring lands at exactly 0.9.
+_DEFAULT_DOMAIN_RADIUS = 2.0 * math.atanh(0.9)
 
 _EPS = 1e-3  # matches sphere.py's clip margin: bounds arccosh'/arccos' near the domain edge to a
 # reasonable ~22 (vs. ~707 at 1e-6) rather than letting it approach a machine-precision-scale
@@ -72,7 +81,8 @@ def _mink_dot_np(u: np.ndarray, v: np.ndarray) -> np.ndarray:
 
 def _radial_cdf(n: int, domain_radius: float, num: int = 4000) -> tuple[np.ndarray, np.ndarray]:
     """Numerically inverted CDF of the hyperbolic-volume radial density sinh(r)^(n-1) on
-    [0, domain_radius], used by sample_domain/_sample_obstacles for volume-correct ball sampling.
+    [0, domain_radius], used by sample_domain/_sample_ball_obstacles/_sample_ray_obstacles for
+    volume-correct ball sampling.
 
     Hyperbolic volume grows like sinh(r)^(n-1) dr (the "sphere of radius r" has that much
     (n-1)-measure), so uniform-in-r sampling would badly undersample the outer region — unlike
@@ -116,7 +126,7 @@ def _lorentz_frame(mu: jnp.ndarray, n: int) -> jnp.ndarray:
     return jnp.where(safe, reflected, rest)
 
 
-def _dist_perp(mu: jnp.ndarray, x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+def dist_perp(mu: jnp.ndarray, x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Geodesic distance d and eta-unit tangent direction e_perp from mu toward x.
 
     c = <mu,x>_eta <= -1 always (two points on the upper sheet); clipped away from -1 (x=mu) so
@@ -152,7 +162,7 @@ def _d_over_sinh(d: jnp.ndarray) -> jnp.ndarray:
     return jnp.where(small, taylor, exact)
 
 
-def _ray_dist(x: jnp.ndarray, origin: jnp.ndarray, direction: jnp.ndarray, length: float) -> jnp.ndarray:
+def ray_dist(x: jnp.ndarray, origin: jnp.ndarray, direction: jnp.ndarray, length: float) -> jnp.ndarray:
     """Geodesic distance from x to the ray {cosh(t)*origin + sinh(t)*direction : t in [0, length]}
     (origin on H^n, direction an eta-unit tangent vector at origin). Broadcasts over leading dims
     of x (origin/direction stay single).
@@ -176,13 +186,20 @@ def _ray_dist(x: jnp.ndarray, origin: jnp.ndarray, direction: jnp.ndarray, lengt
     return jnp.arccosh(-c)
 
 
-def _ray_dist_np(x: np.ndarray, origin: np.ndarray, direction: np.ndarray, length: float) -> np.ndarray:
-    """NumPy counterpart of _ray_dist, for host-side sampling/RRT*."""
+def ray_dist_np(x: np.ndarray, origin: np.ndarray, direction: np.ndarray, length: float) -> np.ndarray:
+    """NumPy counterpart of ray_dist, for host-side sampling/RRT*."""
     eta_xo = _mink_dot_np(x, origin)
     eta_xd = _mink_dot_np(x, direction)
     t_star = np.arctanh(np.clip(-eta_xd / eta_xo, -1.0 + 1e-6, 1.0 - 1e-6))
     t = np.clip(t_star, 0.0, length)
     c = np.minimum(np.cosh(t) * eta_xo + np.sinh(t) * eta_xd, -1.0 - _EPS)
+    return np.arccosh(-c)
+
+
+def _point_dist_np(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """NumPy counterpart of ``geodesic``: point-to-point distance (not to a ray), for ball-obstacle
+    clearance checks and ``sdf_np``'s ball terms."""
+    c = np.minimum(_mink_dot_np(x, y), -1.0 - _EPS)
     return np.arccosh(-c)
 
 
@@ -197,22 +214,26 @@ class LorentzHyperbolicEnvironment:
     there's no "whole manifold" to place obstacles on or sample collocation points from —
     ``domain_radius`` plays the torus's ``[-π,π)^dim`` / the sphere's whole-S^n role).
 
-    Obstacles are capsule-thickened geodesic rays (not balls, unlike torus/sphere): each ray
+    Obstacles default to geodesic balls — the same primitive torus/sphere/so3/
+    PoincareHyperbolicEnvironment use (``num_obstacles``, ``obstacle_radius``), so the default scene
+    is directly comparable across every manifold in this repo, hyperbolic included. Capsule-
+    thickened geodesic *rays* are also available (``num_ray_obstacles``, off by default): each ray
     originates at a point sampled within ``domain_radius`` of ``start`` and continues *outward*
     along the ``start``-to-origin geodesic (i.e. its direction is the tangent at the origin point
     continuing away from ``start``, not toward it) for a random length. This casts a "shadow
     wedge" directly behind each ray from the source's point of view — a deliberately sharper
     occlusion test than a ball, given H^n's exponential volume growth makes that shadow region
-    large. See hyperbolic_TODO.md's "Ray obstacles" section for the derivation and the earlier
-    ball-obstacle design this replaced.
+    large. See hyperbolic_TODO.md's "Ray obstacles" section for the derivation.
 
     See module docstring STATUS.
     """
 
     start: tuple[float, ...] = (0.0, 0.0, 1.0)
     n: int = 2
-    domain_radius: float = 2.5
+    domain_radius: float = _DEFAULT_DOMAIN_RADIUS
     num_obstacles: int = 3
+    obstacle_radius: tuple[float, float] = (0.5, 0.9)
+    num_ray_obstacles: int = 0
     ray_length: tuple[float, float] = (0.8, 1.8)
     ray_thickness: tuple[float, float] = (0.08, 0.15)
     slowness_max: float = 10.0
@@ -240,13 +261,31 @@ class LorentzHyperbolicEnvironment:
         self._start_frame_np = np.asarray(_lorentz_frame(start_arr, self.n))  # [dim, n], reused by
         # sample_domain/boundary_ring_np (both draw eta-unit tangent directions at start)
         self._radial_cdf_r, self._radial_cdf_p = _radial_cdf(self.n, self.domain_radius)
-        self.obstacles: tuple[Obstacle, ...] = self._sample_obstacles()
+        # one shared rng stream so ball obstacles are sampled before rays, deterministic given seed
+        rng = np.random.default_rng(self.seed + _OBSTACLE_SEED_OFFSET)
+        self.ball_obstacles: tuple[BallObstacle, ...] = self._sample_ball_obstacles(rng)
+        self.ray_obstacles: tuple[RayObstacle, ...] = self._sample_ray_obstacles(rng)
+        self.obstacles: tuple[Obstacle, ...] = self.ball_obstacles + self.ray_obstacles
 
     @property
     def title(self) -> str:
-        return f"hyperbolic H^{self.n} — time-to-go ({self.num_obstacles} obstacles)"
+        return f"hyperbolic H^{self.n} — time-to-go ({len(self.obstacles)} obstacles)"
 
-    def _sample_obstacles(self) -> tuple[Obstacle, ...]:
+    def _sample_ball_obstacles(self, rng: np.random.Generator) -> tuple[BallObstacle, ...]:
+        """Reproducible geodesic-ball obstacles within domain_radius of start, clear of the source —
+        the same primitive torus/sphere/so3/PoincareHyperbolicEnvironment use, so a default (all-
+        ball) scene here is directly comparable to those, and to PoincareHyperbolicEnvironment's own
+        default scene in particular."""
+        start = np.asarray(self.start, dtype=np.float64)
+        obstacles: list[BallObstacle] = []
+        while len(obstacles) < self.num_obstacles:
+            centre = self.sample_domain(rng, 1)[0]
+            radius = float(rng.uniform(*self.obstacle_radius))
+            if float(_point_dist_np(centre, start)) > radius + 0.3:
+                obstacles.append((*centre.tolist(), radius))
+        return tuple(obstacles)
+
+    def _sample_ray_obstacles(self, rng: np.random.Generator) -> tuple[RayObstacle, ...]:
         """Reproducible geodesic-ray obstacles within domain_radius of start, clear of the source.
 
         Each ray originates at a point p sampled via sample_domain, with direction = the tangent
@@ -259,15 +298,14 @@ class LorentzHyperbolicEnvironment:
         away from the basepoint moves monotonically farther from it, the ray's own closest point
         to start is always its origin p — so the clearance check only needs d(p, start).
         """
-        rng = np.random.default_rng(self.seed + _OBSTACLE_SEED_OFFSET)
         start = jnp.asarray(self.start, dtype=jnp.float32)
-        obstacles: list[Obstacle] = []
-        while len(obstacles) < self.num_obstacles:
+        obstacles: list[RayObstacle] = []
+        while len(obstacles) < self.num_ray_obstacles:
             p_np = self.sample_domain(rng, 1)[0]
             p = jnp.asarray(p_np, dtype=jnp.float32)
             length = float(rng.uniform(*self.ray_length))
             thickness = float(rng.uniform(*self.ray_thickness))
-            d, w = _dist_perp(start, p)  # tangent at start pointing toward p
+            d, w = dist_perp(start, p)  # tangent at start pointing toward p
             if float(d) > thickness + 0.3:
                 v = jnp.sinh(d) * start + jnp.cosh(d) * w  # tangent at p, continuing outward
                 obstacles.append((*p_np.tolist(), *np.asarray(v).tolist(), length, thickness))
@@ -277,13 +315,13 @@ class LorentzHyperbolicEnvironment:
 
     def log_map(self, mu: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
         """Intrinsic tangent-frame coordinates (size tangent_dim) of x at mu, for splat evaluation."""
-        d, e_perp = _dist_perp(mu, x)
+        d, e_perp = dist_perp(mu, x)
         frame = _lorentz_frame(mu, self.n)
         return d * _mink_dot_cols(e_perp, frame)
 
     def log_map_ambient(self, mu: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
         """Ambient tangent vector (size dim) at mu pointing toward x; eta-norm = geodesic distance."""
-        d, e_perp = _dist_perp(mu, x)
+        d, e_perp = dist_perp(mu, x)
         return d * e_perp
 
     def jac_factor(self, mu: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
@@ -292,7 +330,7 @@ class LorentzHyperbolicEnvironment:
         Unlike the sphere's (theta/sin theta)^(n-1), this needs no clipping away from a
         cut-locus singularity — d/sinh(d) is smooth and bounded in (0,1] for all d >= 0.
         """
-        d, _ = _dist_perp(mu, x)
+        d, _ = dist_perp(mu, x)
         return _d_over_sinh(d) ** (self.n - 1)
 
     def splat_precompute(self, mu: jnp.ndarray):
@@ -303,10 +341,10 @@ class LorentzHyperbolicEnvironment:
         return mu, _lorentz_frame(mu, self.n)
 
     def log_and_jac(self, pre, x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
-        """(log_map, jac_factor) sharing one ``_dist_perp`` call instead of two — mirrors
+        """(log_map, jac_factor) sharing one ``dist_perp`` call instead of two — mirrors
         ``sphere.py``'s ``log_and_jac``."""
         mu, frame = pre
-        d, e_perp = _dist_perp(mu, x)
+        d, e_perp = dist_perp(mu, x)
         jac = _d_over_sinh(d) ** (self.n - 1)
         return d * _mink_dot_cols(e_perp, frame), jac
 
@@ -340,22 +378,37 @@ class LorentzHyperbolicEnvironment:
         return jnp.arccosh(-c)
 
     def wrap_point(self, x: jnp.ndarray) -> jnp.ndarray:
-        """Renormalize onto the hyperboloid sheet via eta (Lorentz analog of the sphere's
-        Euclidean renormalization); a no-op for points already on H^n, a projection for e.g. the
-        ambient-linear interpolation RRT* uses between two hyperboloid points (which stays inside
-        the convex future timelike cone, so the renormalizing sqrt is always of a positive number)."""
-        scale = 1.0 / jnp.sqrt(jnp.maximum(-mink_dot(x, x), 1e-12))
-        return x * scale[..., None]
+        """Project onto H^n by fixing the spatial coordinates and solving for the timelike one:
+        (s, t) -> (s, sqrt(1+|s|^2)). Exact identity for x already on H^n (t = sqrt(1+|s|^2)
+        already holds), and — unlike rescaling x by 1/sqrt(-<x,x>_eta) along its own ray, which is
+        only valid while x is genuinely timelike — well-defined for *any* ambient x, spacelike or
+        null included, with no denominator to blow up.
+
+        This replaced the eta-rescaling retraction after it caused real training failures: an
+        unconstrained AdamW step on a splat centre ``B`` can — especially with weight_decay, which
+        pulls B toward the ambient *origin*, exactly the rescaling retraction's singularity — drift
+        B onto or past the light cone, where -<x,x>_eta <= 0 and the old formula's
+        ``1/sqrt(max(..., 1e-12))`` doesn't correct that, it *amplifies* it (a huge scale on an
+        already-drifted vector); measured ``|B|`` growing 9.5 -> 1.7e20 over 20 steps before the
+        eventual overflow to inf/nan poisoned every parameter. This retraction cannot diverge that
+        way: as the spatial part shrinks (e.g. under weight decay), sqrt(1+|s|^2) -> 1 and the point
+        converges to the apex (0,...,0,1) — H^n's own origin — instead of a singularity.
+        """
+        spatial = x[..., :-1]
+        t = jnp.sqrt(1.0 + jnp.sum(spatial * spatial, axis=-1, keepdims=True))
+        return jnp.concatenate([spatial, t], axis=-1)
 
     def wrap_point_np(self, x: np.ndarray) -> np.ndarray:
+        """NumPy counterpart of ``wrap_point``."""
         x = np.asarray(x, dtype=np.float64)
-        scale = 1.0 / np.sqrt(np.maximum(-_mink_dot_np(x, x), 1e-12))
-        return x * scale[..., None]
+        spatial = x[..., :-1]
+        t = np.sqrt(1.0 + np.sum(spatial * spatial, axis=-1, keepdims=True))
+        return np.concatenate([spatial, t], axis=-1)
 
     def displacement_np(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
         """Ambient tangent vector at a pointing toward b; eta-norm = geodesic distance. Broadcasts.
 
-        NumPy counterpart of log_map_ambient (same c/perp/e_perp construction, see _dist_perp)."""
+        NumPy counterpart of log_map_ambient (same c/perp/e_perp construction, see dist_perp)."""
         a = np.asarray(a, dtype=np.float64)
         b = np.asarray(b, dtype=np.float64)
         c = np.minimum(_mink_dot_np(a, b), -1.0 - _EPS)
@@ -378,13 +431,13 @@ class LorentzHyperbolicEnvironment:
     # ---- obstacle / slowness field -----------------------------------------
 
     def sdf(self, points: jnp.ndarray) -> jnp.ndarray:
-        """Signed geodesic distance to the union of capsule-thickened obstacle rays."""
-        per = []
-        for obs in self.obstacles:
+        """Signed geodesic distance to the union of ball obstacles and capsule-thickened rays."""
+        per = [self.geodesic(points, jnp.array(obs[:-1])) - obs[-1] for obs in self.ball_obstacles]
+        for obs in self.ray_obstacles:
             origin = jnp.array(obs[: self.dim])
             direction = jnp.array(obs[self.dim : 2 * self.dim])
             length, thickness = obs[-2], obs[-1]
-            per.append(_ray_dist(points, origin, direction, length) - thickness)
+            per.append(ray_dist(points, origin, direction, length) - thickness)
         return jnp.min(jnp.stack(per, axis=0), axis=0)
 
     def slowness(self, points: jnp.ndarray) -> jnp.ndarray:
@@ -393,12 +446,12 @@ class LorentzHyperbolicEnvironment:
 
     def sdf_np(self, points: np.ndarray) -> np.ndarray:
         """NumPy signed distance (host-side, for RRT*'s hot loop)."""
-        per = []
-        for obs in self.obstacles:
+        per = [_point_dist_np(points, np.array(obs[:-1])) - obs[-1] for obs in self.ball_obstacles]
+        for obs in self.ray_obstacles:
             origin = np.array(obs[: self.dim])
             direction = np.array(obs[self.dim : 2 * self.dim])
             length, thickness = obs[-2], obs[-1]
-            per.append(_ray_dist_np(points, origin, direction, length) - thickness)
+            per.append(ray_dist_np(points, origin, direction, length) - thickness)
         return np.min(per, axis=0)
 
     def slowness_np(self, points: np.ndarray) -> np.ndarray:
@@ -480,9 +533,10 @@ class LorentzHyperbolicEnvironment:
         intrinsic (r, ψ) grid (via _r_psi_grid, identical to the one _geodesic_polar_ambient
         embeds into ambient space), not a literal ambient-Lorentz-to-disk projection — so it's
         correct for any `start`, not just the literal apex the standard x[:n]/(1+x[n]) formula is
-        centered on. domain_radius=2.5's default puts the outer ring at tanh(1.25)≈0.85, leaving
-        visible margin to the disk boundary (see hyperbolic_TODO.md open question #2 on tuning
-        this for a given scene).
+        centered on. The default domain_radius (= 2*artanh(0.9), matching
+        PoincareHyperbolicEnvironment's default trunc_radius) puts the outer ring at exactly
+        tanh(domain_radius/2) = 0.9 — the same disk radius as that environment's truncation rim, so
+        the two hyperbolic environments' default renders share an outer boundary.
         """
         if self.n != 2:
             raise NotImplementedError("render_grid_xy() needs a dense grid — only tractable at n=2")

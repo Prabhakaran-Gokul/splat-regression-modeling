@@ -54,8 +54,13 @@ class Config:
             ``weak_supervision`` (RRT* prior the PDE refines), or the published baselines
             ``ntfields`` / ``pntfields`` / ``hntfields``, which share the ``T = base/τ`` field so the
             comparison isolates the objective. ``backend`` is ``srm`` (splat mixture) or ``mlp``.
-        scene — ``start``, ``num_obstacles``, ``obstacle_radius`` (geodesic), ``slowness_max``,
-            ``slow_width``; ``trunc_radius`` bounds the hyperbolic chart (H^d is unbounded).
+        scene — ``start``, ``num_obstacles``, ``obstacle_radius`` (geodesic, ball obstacles — the
+            default shape on every environment), ``slowness_max``, ``slow_width``; ``trunc_radius``
+            bounds the hyperbolic chart (H^d is unbounded), shared by both hyperbolic environments
+            so their domains are comparable (Lorentz's ``domain_radius = 2·artanh(trunc_radius)``,
+            matching Poincaré's own ``wall_distance`` exactly). ``num_ray_obstacles``/``ray_length``/
+            ``ray_thickness`` add optional capsule-thickened geodesic-ray obstacles on top of the
+            ball obstacles, on both hyperbolic environments identically (off — 0 rays — by default).
         budget — ``steps``, ``lr``, ``num_collocation``, ``seed``, ``resolution`` (scoring grid only).
         adaptive capacity (``srm``) — the model picks its own size: it grows where the residual is
             and stops when a densify pass buys less than ``densify_min_gain`` fractional residual
@@ -82,8 +87,9 @@ class Config:
     slowness_max: float = 10.0
     slow_width: float = 0.15
     trunc_radius: float = 0.9  # hyperbolic only
-    ray_length: tuple[float, float] = (0.8, 1.8)  # lorentz hyperbolic only
-    ray_thickness: tuple[float, float] = (0.08, 0.15)  # lorentz hyperbolic only
+    num_ray_obstacles: int = 0  # hyperbolic only (poincare_hyperbolic / lorentz_hyperbolic)
+    ray_length: tuple[float, float] = (0.8, 1.8)  # hyperbolic only
+    ray_thickness: tuple[float, float] = (0.08, 0.15)  # hyperbolic only
     # causal weighting (all strategies)
     causal: bool = True
     causal_strength: float = 5.0
@@ -169,6 +175,9 @@ def _build_env(cfg: Config):
             dim=cfg.dim,
             num_obstacles=cfg.num_obstacles,
             obstacle_radius=cfg.obstacle_radius,
+            num_ray_obstacles=cfg.num_ray_obstacles,
+            ray_length=cfg.ray_length,
+            ray_thickness=cfg.ray_thickness,
             slowness_max=cfg.slowness_max,
             slow_width=cfg.slow_width,
             trunc_radius=cfg.trunc_radius,
@@ -176,11 +185,18 @@ def _build_env(cfg: Config):
         )
     if cfg.environment == "lorentz_hyperbolic":
         start = cfg.start if cfg.start is not None else (0.0,) * cfg.dim + (1.0,)
+        # domain_radius = 2*artanh(trunc_radius): the same conversion PoincareHyperbolicEnvironment
+        # applies internally (its own wall_distance), so one --trunc_radius sizes both hyperbolic
+        # environments' domains identically instead of trunc_radius=0.9 (a Poincaré ball-fraction)
+        # being handed to Lorentz as a *geodesic radius* directly — a ~3x-smaller domain than intended.
+        domain_radius = 2.0 * float(np.arctanh(min(cfg.trunc_radius, 1.0 - 1e-6)))
         return ENVIRONMENTS["lorentz_hyperbolic"](
             start=start,  # apex (0,...,0,1) also satisfies H^n's <x,x>_eta=-1, same default as sphere
             n=cfg.dim,
-            domain_radius=cfg.trunc_radius,
+            domain_radius=domain_radius,
             num_obstacles=cfg.num_obstacles,
+            obstacle_radius=cfg.obstacle_radius,
+            num_ray_obstacles=cfg.num_ray_obstacles,
             ray_length=cfg.ray_length,
             ray_thickness=cfg.ray_thickness,
             slowness_max=cfg.slowness_max,

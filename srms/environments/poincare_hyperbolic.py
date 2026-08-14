@@ -55,7 +55,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-Obstacle = tuple[float, ...]  # (*centre[dim] chart coords, hyperbolic radius)
+from srms.environments.lorentz_hyperbolic import dist_perp, ray_dist, ray_dist_np
+
+BallObstacle = tuple[float, ...]  # (*centre[dim] chart coords, hyperbolic radius)
+RayObstacle = tuple[float, ...]  # (*origin_ambient[dim+1], *direction_ambient[dim+1], length,
+# thickness) — ambient Lorentz-hyperboloid coordinates, *not* chart coordinates: geodesics are
+# circular arcs in the Poincaré ball but straight mink_dot algebra on the hyperboloid, so ray
+# obstacles are sampled/evaluated via ``_to_hyperboloid`` and lorentz_hyperbolic's ``dist_perp``/
+# ``ray_dist`` rather than re-deriving Möbius-model ray distances from scratch.
+Obstacle = BallObstacle | RayObstacle
 
 _OBSTACLE_SEED_OFFSET = 5
 _MAX_NORM = 1.0 - 1e-6  # keep artanh finite for points pushed onto/past the ideal boundary
@@ -125,6 +133,30 @@ def _clamp_ball_np(x: np.ndarray) -> np.ndarray:
     return x * np.minimum(1.0, _MAX_NORM / np.maximum(norm, 1e-12))
 
 
+def _to_hyperboloid(x: jnp.ndarray) -> jnp.ndarray:
+    """Poincaré-ball chart point(s) -> Lorentz-hyperboloid ambient coordinates (size dim+1).
+
+    The standard isometry between the two curvature -1 models: y = (2x, 1+‖x‖²) / (1-‖x‖²)
+    satisfies the hyperboloid's ``<y,y>_eta = -1`` exactly for any x with ‖x‖ < 1 (a short algebra
+    check: Σy_i² - y_last² = [4‖x‖² - (1+‖x‖²)²] / (1-‖x‖²)² = -1). Used only for ray-obstacle
+    geometry (``_sample_ray_obstacles``/``sdf``'s ray terms), which reuses lorentz_hyperbolic's
+    ``dist_perp``/``ray_dist`` on this ambient point rather than re-deriving Möbius-model ray
+    distances.
+    """
+    x = _clamp_ball(x)
+    norm_sq = jnp.sum(x * x, axis=-1, keepdims=True)
+    denom = jnp.maximum(1.0 - norm_sq, 1e-12)
+    return jnp.concatenate([2.0 * x / denom, (1.0 + norm_sq) / denom], axis=-1)
+
+
+def _to_hyperboloid_np(x: np.ndarray) -> np.ndarray:
+    """NumPy counterpart of ``_to_hyperboloid``."""
+    x = _clamp_ball_np(x)
+    norm_sq = np.sum(x * x, axis=-1, keepdims=True)
+    denom = np.maximum(1.0 - norm_sq, 1e-12)
+    return np.concatenate([2.0 * x / denom, (1.0 + norm_sq) / denom], axis=-1)
+
+
 def _log_map_np(mu: np.ndarray, x: np.ndarray) -> np.ndarray:
     u = _mobius_add_np(-_clamp_ball_np(mu), _clamp_ball_np(x))
     norm = np.linalg.norm(u, axis=-1, keepdims=True)
@@ -139,12 +171,24 @@ def _distance_np(x: np.ndarray, y: np.ndarray) -> np.ndarray:
 
 @dataclasses.dataclass
 class PoincareHyperbolicEnvironment:
-    """H^d in the Poincaré ball with a smooth slowness field rising around geodesic balls."""
+    """H^d in the Poincaré ball with a smooth slowness field rising around geodesic balls.
+
+    Obstacles default to geodesic balls (``num_obstacles``, ``obstacle_radius``) — the same
+    primitive torus/sphere/so3/LorentzHyperbolicEnvironment use, so the default scene is directly
+    comparable across every manifold in this repo. Capsule-thickened geodesic *rays* are also
+    available (``num_ray_obstacles``, off by default), matching LorentzHyperbolicEnvironment's ray
+    obstacles exactly (same ``ray_length``/``ray_thickness`` distributions, same clearance rule) —
+    see ``_sample_ray_obstacles``/``_to_hyperboloid`` for how ray geometry is evaluated in this
+    chart despite geodesics here being circular arcs rather than straight lines.
+    """
 
     start: tuple[float, ...] = (0.0, 0.0)
     dim: int = 2
     num_obstacles: int = 3
     obstacle_radius: tuple[float, float] = (0.5, 0.9)
+    num_ray_obstacles: int = 0
+    ray_length: tuple[float, float] = (0.8, 1.8)
+    ray_thickness: tuple[float, float] = (0.08, 0.15)
     slowness_max: float = 10.0
     slow_width: float = 0.15
     trunc_radius: float = 0.9
@@ -156,6 +200,7 @@ class PoincareHyperbolicEnvironment:
         if float(np.linalg.norm(self.start)) >= self.trunc_radius:
             raise ValueError(f"start must lie inside the truncation ball ‖x‖ < {self.trunc_radius}")
         self.tangent_dim = self.dim
+        self.ambient_dim = self.dim + 1  # Lorentz-hyperboloid ambient size, for ray-obstacle geometry
         # Chart extent, not a period: only mlp.py reads it, and a ball has nothing periodic to encode.
         self.domain: tuple[float, float] = (-self.trunc_radius, self.trunc_radius)
         self.axis_labels: tuple[str, str] = ("x₁ (Poincaré chart)", "x₂ (Poincaré chart)")
@@ -167,21 +212,27 @@ class PoincareHyperbolicEnvironment:
         )
         self.wall_distance = float(2.0 * np.arctanh(min(self.trunc_radius, _MAX_NORM)))
         self.has_dense_gt = self.dim in (2, 3)  # dense fast marching tractable at 2-D and 3-D
-        self.obstacles: tuple[Obstacle, ...] = self._sample_obstacles()
+        # one shared rng stream so ball obstacles are sampled before rays, deterministic given seed
+        rng = np.random.default_rng(self.seed + _OBSTACLE_SEED_OFFSET)
+        self.ball_obstacles: tuple[BallObstacle, ...] = self._sample_ball_obstacles(rng)
+        self.ray_obstacles: tuple[RayObstacle, ...] = self._sample_ray_obstacles(rng)
+        self.obstacles: tuple[Obstacle, ...] = self.ball_obstacles + self.ray_obstacles
 
     @property
     def title(self) -> str:
-        return f"hyperbolic H^{self.dim} (Poincaré ball) — time-to-go ({self.num_obstacles} obstacles)"
+        return f"hyperbolic H^{self.dim} (Poincaré ball) — time-to-go ({len(self.obstacles)} obstacles)"
 
     @property
     def gt_label(self) -> str:
         return "ground truth — Euclidean FMM, conformally rescaled"
 
-    def _sample_obstacles(self) -> tuple[Obstacle, ...]:
-        """Reproducible geodesic-ball obstacles, clear of both the source and the rim wall."""
-        rng = np.random.default_rng(self.seed + _OBSTACLE_SEED_OFFSET)
+    def _sample_ball_obstacles(self, rng: np.random.Generator) -> tuple[BallObstacle, ...]:
+        """Reproducible geodesic-ball obstacles, clear of both the source and the rim wall — the
+        same primitive torus/sphere/so3/LorentzHyperbolicEnvironment use, so a default (all-ball)
+        scene here is directly comparable to those, and to LorentzHyperbolicEnvironment's own
+        default scene in particular."""
         start = np.asarray(self.start, dtype=float)
-        obstacles: list[Obstacle] = []
+        obstacles: list[BallObstacle] = []
         while len(obstacles) < self.num_obstacles:
             direction = rng.standard_normal(self.dim)
             direction /= np.linalg.norm(direction)
@@ -191,6 +242,26 @@ class PoincareHyperbolicEnvironment:
             clear_of_wall = self.wall_distance - _distance_np(centre, np.zeros(self.dim)) > radius + 0.3
             if clear_of_source and clear_of_wall:
                 obstacles.append((*centre.tolist(), radius))
+        return tuple(obstacles)
+
+    def _sample_ray_obstacles(self, rng: np.random.Generator) -> tuple[RayObstacle, ...]:
+        """Reproducible capsule-thickened geodesic-ray obstacles, mirroring
+        LorentzHyperbolicEnvironment's ``_sample_ray_obstacles`` exactly (same "outward tangent"
+        construction, same clearance rule) but sampled/stored in *ambient Lorentz-hyperboloid*
+        coordinates via ``_to_hyperboloid`` — geodesics are circular arcs in the Poincaré ball, so
+        the tangent-continuation algebra that construction relies on only closes in the hyperboloid
+        chart, not here."""
+        start_ambient = _to_hyperboloid(jnp.asarray(self.start, dtype=jnp.float32))
+        obstacles: list[RayObstacle] = []
+        while len(obstacles) < self.num_ray_obstacles:
+            p_np = self.sample_domain(rng, 1)[0]
+            length = float(rng.uniform(*self.ray_length))
+            thickness = float(rng.uniform(*self.ray_thickness))
+            p_ambient = _to_hyperboloid(jnp.asarray(p_np, dtype=jnp.float32))
+            d, w = dist_perp(start_ambient, p_ambient)  # tangent at start pointing toward p
+            if float(d) > thickness + 0.3:
+                v = jnp.sinh(d) * start_ambient + jnp.cosh(d) * w  # tangent at p, continuing outward
+                obstacles.append((*p_ambient.tolist(), *np.asarray(v).tolist(), length, thickness))
         return tuple(obstacles)
 
     # ---- manifold geometry -----------------------------------------------
@@ -285,8 +356,16 @@ class PoincareHyperbolicEnvironment:
         return jnp.where(distance(jnp.zeros(self.dim), x) <= self.wall_distance, large, -large)
 
     def sdf(self, x: jnp.ndarray) -> jnp.ndarray:
-        """Signed hyperbolic distance to the union of obstacle balls *and the truncation wall*."""
-        per = [distance(jnp.asarray(obs[:-1]), x) - obs[-1] for obs in self.obstacles]
+        """Signed hyperbolic distance to the union of obstacle balls, obstacle rays (if any) *and
+        the truncation wall*."""
+        per = [distance(jnp.asarray(obs[:-1]), x) - obs[-1] for obs in self.ball_obstacles]
+        if self.ray_obstacles:
+            ambient_x = _to_hyperboloid(x)
+            for obs in self.ray_obstacles:
+                origin = jnp.array(obs[: self.ambient_dim])
+                direction = jnp.array(obs[self.ambient_dim : 2 * self.ambient_dim])
+                length, thickness = obs[-2], obs[-1]
+                per.append(ray_dist(ambient_x, origin, direction, length) - thickness)
         per.append(self._rim_sdf(x))
         return jnp.min(jnp.stack(per, axis=0), axis=0)
 
@@ -297,7 +376,14 @@ class PoincareHyperbolicEnvironment:
     def sdf_np(self, points: np.ndarray) -> np.ndarray:
         """NumPy signed distance (host-side, for RRT*'s hot loop)."""
         points = np.asarray(points, dtype=float)
-        per = [_distance_np(np.array(obs[:-1]), points) - obs[-1] for obs in self.obstacles]
+        per = [_distance_np(np.array(obs[:-1]), points) - obs[-1] for obs in self.ball_obstacles]
+        if self.ray_obstacles:
+            ambient_points = _to_hyperboloid_np(points)
+            for obs in self.ray_obstacles:
+                origin = np.array(obs[: self.ambient_dim])
+                direction = np.array(obs[self.ambient_dim : 2 * self.ambient_dim])
+                length, thickness = obs[-2], obs[-1]
+                per.append(ray_dist_np(ambient_points, origin, direction, length) - thickness)
         inside = _distance_np(np.zeros(self.dim), points) <= self.wall_distance
         per.append(np.where(inside, 1e3, -1e3))  # domain mask, not a wall — see _rim_sdf
         return np.min(per, axis=0)
