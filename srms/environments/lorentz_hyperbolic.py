@@ -295,6 +295,21 @@ class LorentzHyperbolicEnvironment:
         d, _ = _dist_perp(mu, x)
         return _d_over_sinh(d) ** (self.n - 1)
 
+    def splat_precompute(self, mu: jnp.ndarray):
+        """Per-splat geometry: the eta-orthonormal tangent frame at mu, which the per-point loop
+        must not rebuild — mirrors ``sphere.py``'s ``splat_precompute`` (see its docstring for the
+        n*k-vs-k cost this hoists out of ``srm.py``'s inner loop; ``_lorentz_frame`` depends only
+        on the splat centre)."""
+        return mu, _lorentz_frame(mu, self.n)
+
+    def log_and_jac(self, pre, x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """(log_map, jac_factor) sharing one ``_dist_perp`` call instead of two — mirrors
+        ``sphere.py``'s ``log_and_jac``."""
+        mu, frame = pre
+        d, e_perp = _dist_perp(mu, x)
+        jac = _d_over_sinh(d) ** (self.n - 1)
+        return d * _mink_dot_cols(e_perp, frame), jac
+
     def metric_inv(self, x: jnp.ndarray) -> jnp.ndarray:
         """Quadratic form recovering the intrinsic squared-gradient norm from an ambient
         Euclidean-component gradient via grad @ metric_inv(x) @ grad: eta + x x^T.
