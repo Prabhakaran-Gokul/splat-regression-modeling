@@ -5,7 +5,7 @@ description = "Splat Regression Models for geodesic path planning"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "jax>=0.4.30",
+    "jax[cuda12]>=0.4.30",
     "numpy>=1.26",
     "matplotlib>=3.8",
     "optax>=0.2",

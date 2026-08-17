@@ -74,7 +74,7 @@ class Config:
     environment: Literal["torus", "sphere", "poincare_hyperbolic", "lorentz_hyperbolic"] = "torus"
     dim: int = 2
     method: Literal["eikonal", "weak_supervision", "ntfields", "pntfields", "hntfields"] = "eikonal"
-    backend: Literal["srm", "mlp"] = "srm"
+    backend: Literal["srm", "mlp", "mlp_raw", "mlp_resnet"] = "srm"
     # scene
     start: tuple[float, ...] | None = None
     num_obstacles: int = 3

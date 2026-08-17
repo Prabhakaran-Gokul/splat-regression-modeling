@@ -3373,8 +3373,8 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "flax" },
-    { name = "jax", version = "0.10.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
-    { name = "jax", version = "0.11.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "jax", version = "0.10.2", source = { registry = "https://pypi.org/simple" }, extra = ["cuda12"], marker = "python_full_version < '3.12'" },
+    { name = "jax", version = "0.11.0", source = { registry = "https://pypi.org/simple" }, extra = ["cuda12"], marker = "python_full_version >= '3.12'" },
     { name = "jaxkan" },
     { name = "matplotlib" },
     { name = "mlflow" },
@@ -3399,7 +3399,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "flax", specifier = ">=0.8" },
-    { name = "jax", specifier = ">=0.4.30" },
+    { name = "jax", extras = ["cuda12"], specifier = ">=0.4.30" },
     { name = "jax", extras = ["cuda12"], marker = "sys_platform == 'linux' and extra == 'gpu'", specifier = ">=0.4.30" },
     { name = "jaxkan", specifier = ">=0.1" },
     { name = "matplotlib", specifier = ">=3.8" },
