@@ -168,6 +168,33 @@ adopted — the direct Eikonal with the NTFields-style factored field won. Antip
 *hurts*; tighter `τ_min` hurts; rim-seeded splats are neutral; gentle slowness ramp hurts (spreads the
 obstacle). See the dated sections below for the full trail.
 
+**Collocation: boosting count helps a little, restricting to free space doesn't (2026-08-19, `srms/`,
+`torus ntfields srm --no-densify`).** Added `cfg.colloc_exclude_obstacles` (`sample_collocation` in
+`eikonal.py`, shared by `eikonal`/`ntfields`/`pntfields`) to test two knobs against the canonical
+384-splat, 4000-step, `--no-densify` config, 5 obstacle seeds (`--seed 1..5`, i.e. 5 distinct scenes —
+num_params fixed at 2,688 throughout, so this isolates the sampling question from capacity):
+
+| config | mean RMS | Δ RMS | seeds improved | mean max\|err\| |
+|---|---|---|---|---|
+| baseline (2048 colloc, whole domain) | 0.303 | — | — | 1.590 |
+| 4x collocation (8192) | 0.287 | **−5.2%** | **5/5** | **−5.7%** |
+| 4x + exclude obstacles (`sdf<0` dropped) | 0.302 | −2.0% | 3/5 | **+34%** |
+| exclude obstacles only (2048) | 0.302 | −2.7% | 3/5 | **+46%** |
+
+**Boosting collocation is a small, reliable, cheap win** — RMS improved in all 5 scenes (mean −5.2%,
+range −1.8% to −8.3%), max\|err\| improved on 4/5. Pushing further to 8x (16384, 3 seeds re-checked)
+kept improving on 2/3 (down to −10% RMS vs baseline) and was flat/noise on the third — diminishing but
+not reversing returns, consistent with this just being PDE-residual Monte-Carlo variance reduction, not
+a qualitative fix. Cost is sub-linear in collocation count (4x colloc ≈ 2x wall-clock at fixed steps).
+**Excluding obstacle-interior collocation is *not* a reliable win and should stay off (the flag's
+default).** RMS is a coin flip across seeds (one scene got 9–12% *worse*), and max\|err\| got
+dramatically worse on average (+34–46%, spiking +63–126% on 2 of 5 scenes) — the failure mode is
+exactly the one this log already diagnosed above: pure-physics NTFields under-determines the field
+*behind* obstacles, and the obstacle interior is one of the few places collocation pins the
+slowness-driven barrier that shapes that shadow; removing it starves the shadow region further rather
+than helping it. **Takeaway: raise `--num_collocation` when compute allows it; don't gate collocation
+on `sdf`.**
+
 ---
 
 ## Goal & success criterion
