@@ -1,4 +1,5 @@
 from srms.environments.lorentz_hyperbolic import LorentzHyperbolicEnvironment
+from srms.environments.plane import PlaneEnvironment
 from srms.environments.poincare_hyperbolic import PoincareHyperbolicEnvironment
 from srms.environments.so3 import SO3Environment
 from srms.environments.sphere import SphereEnvironment
@@ -6,10 +7,19 @@ from srms.environments.torus import TorusEnvironment
 
 ENVIRONMENTS = {
     "torus": TorusEnvironment,
+    "plane": PlaneEnvironment,
     "sphere": SphereEnvironment,
     "so3": SO3Environment,
     "lorentz_hyperbolic": LorentzHyperbolicEnvironment,
     "poincare_hyperbolic": PoincareHyperbolicEnvironment,
 }
 
-__all__ = ["ENVIRONMENTS", "LorentzHyperbolicEnvironment", "PoincareHyperbolicEnvironment", "SO3Environment", "SphereEnvironment", "TorusEnvironment"]
+__all__ = [
+    "ENVIRONMENTS",
+    "LorentzHyperbolicEnvironment",
+    "PlaneEnvironment",
+    "PoincareHyperbolicEnvironment",
+    "SO3Environment",
+    "SphereEnvironment",
+    "TorusEnvironment",
+]

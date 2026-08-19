@@ -78,7 +78,7 @@ class Config:
 
     """
 
-    environment: Literal["torus", "sphere", "poincare_hyperbolic", "lorentz_hyperbolic"] = "torus"
+    environment: Literal["torus", "plane", "sphere", "poincare_hyperbolic", "lorentz_hyperbolic"] = "torus"
     dim: int = 2
     method: Literal["eikonal", "weak_supervision", "ntfields", "pntfields", "hntfields"] = "eikonal"
     backend: Literal["srm", "mlp", "mlp_raw", "mlp_resnet"] = "srm"
@@ -163,6 +163,17 @@ def _build_env(cfg: Config):
     if cfg.environment == "torus":
         start = cfg.start if cfg.start is not None else (-1.5,) * cfg.dim
         return ENVIRONMENTS["torus"](
+            start=start,
+            dim=cfg.dim,
+            num_obstacles=cfg.num_obstacles,
+            obstacle_radius=cfg.obstacle_radius,
+            slowness_max=cfg.slowness_max,
+            slow_width=cfg.slow_width,
+            seed=cfg.seed,
+        )
+    if cfg.environment == "plane":
+        start = cfg.start if cfg.start is not None else (-1.5,) * cfg.dim
+        return ENVIRONMENTS["plane"](
             start=start,
             dim=cfg.dim,
             num_obstacles=cfg.num_obstacles,
