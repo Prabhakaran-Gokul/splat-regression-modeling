@@ -38,11 +38,23 @@ def source_sphere(env, eps: float, n_pts: int, seed: int) -> tuple[jnp.ndarray, 
     return jnp.asarray(points, dtype=jnp.float32), jnp.full(n_pts, value, dtype=jnp.float32)
 
 
-def sample_collocation(env, rng: np.random.Generator, n: int, exclude_radius: float) -> jnp.ndarray:
-    """Uniform random collocation over the domain, excluding a ball around the source."""
+def sample_collocation(
+    env, rng: np.random.Generator, n: int, exclude_radius: float, exclude_obstacles: bool = False
+) -> jnp.ndarray:
+    """Uniform random collocation over the domain, excluding a ball around the source.
+
+    ``exclude_obstacles`` additionally drops points with ``sdf < 0`` (inside an obstacle) — an
+    ablation knob (``cfg.colloc_exclude_obstacles``): off by default, since the obstacle interior is
+    where the PDE residual pins the slowness blow-up (``s→slowness_max``) that shapes the barrier;
+    dropping it trades that signal for less-noisy free-space collocation. Off keeps this identical to
+    the historical behaviour.
+    """
     pool = env.sample_domain(rng, n * 10)
     dist = np.linalg.norm(env.displacement_np(np.asarray(env.start), pool), axis=-1)
-    return jnp.asarray(pool[dist > exclude_radius][:n], dtype=jnp.float32)
+    mask = dist > exclude_radius
+    if exclude_obstacles:
+        mask &= np.asarray(env.sdf_np(pool)) > 0.0
+    return jnp.asarray(pool[mask][:n], dtype=jnp.float32)
 
 
 def pde_residual(backend, params, thetas: jnp.ndarray, slow: jnp.ndarray, env) -> jnp.ndarray:
@@ -90,7 +102,7 @@ def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
 
     progress = trange(cfg.steps, desc="eikonal")
     for i in progress:
-        colloc = sample_collocation(env, rng, cfg.num_collocation, cfg.source_radius)
+        colloc = sample_collocation(env, rng, cfg.num_collocation, cfg.source_radius, cfg.colloc_exclude_obstacles)
         slow = env.slowness(colloc)
         rate = jnp.float32(training_aids.causal_rate(cfg, i)) if cfg.causal else jnp.float32(0.0)
         params, opt_state, loss, aux = step(params, opt_state, colloc, slow, rate)

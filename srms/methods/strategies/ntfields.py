@@ -146,7 +146,7 @@ def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
     densifier = training_aids.DensifyController(cfg)
     progress = trange(cfg.steps, desc="ntfields")
     for i in progress:
-        colloc = sample_collocation(env, rng, cfg.num_collocation, cfg.source_radius)
+        colloc = sample_collocation(env, rng, cfg.num_collocation, cfg.source_radius, cfg.colloc_exclude_obstacles)
         slow = env.slowness(colloc)
         params, opt_state, loss, aux = step(params, opt_state, colloc, slow)
         densifier.record(loss)

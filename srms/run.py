@@ -61,7 +61,9 @@ class Config:
             matching Poincaré's own ``wall_distance`` exactly). ``num_ray_obstacles``/``ray_length``/
             ``ray_thickness`` add optional capsule-thickened geodesic-ray obstacles on top of the
             ball obstacles, on both hyperbolic environments identically (off — 0 rays — by default).
-        budget — ``steps``, ``lr``, ``num_collocation``, ``seed``, ``resolution`` (scoring grid only).
+        budget — ``steps``, ``lr``, ``num_collocation``, ``colloc_exclude_obstacles`` (drop ``sdf<0``
+            collocation points, ``eikonal``/``ntfields``/``pntfields`` only), ``seed``, ``resolution``
+            (scoring grid only).
         adaptive capacity (``srm``) — the model picks its own size: it grows where the residual is
             and stops when a densify pass buys less than ``densify_min_gain`` fractional residual
             reduction *per splat added*. That test is scale-free in both the loss and the spawn
@@ -144,6 +146,7 @@ class Config:
     # training / output
     num_splats: int = 384
     num_collocation: int = 2048
+    colloc_exclude_obstacles: bool = False
     steps: int = 4000
     lr: float = 3e-3
     init_scale: float = 0.35
