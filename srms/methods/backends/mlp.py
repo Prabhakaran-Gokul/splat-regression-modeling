@@ -89,3 +89,13 @@ def num_params(params: MLPParams) -> int:
     import numpy as _np
 
     return int(sum(_np.prod(_np.shape(x)) for x in jax.tree_util.tree_leaves(params)))
+
+
+def decay_mask(params: MLPParams) -> MLPParams:
+    """Weight-decay mask for ``optax.adamw``: decay everything.
+
+    An MLP has no position parameter analogous to srm's splat centres ``B`` (see
+    ``srm.py``'s ``decay_mask``) — every weight here is an ordinary magnitude/complexity prior
+    target, so nothing needs excluding.
+    """
+    return jax.tree_util.tree_map(lambda _: True, params)

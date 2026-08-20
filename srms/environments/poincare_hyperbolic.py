@@ -72,15 +72,47 @@ _MAX_NORM = 1.0 - 1e-6  # keep artanh finite for points pushed onto/past the ide
 # ---- Poincaré-ball primitives (JAX) ----------------------------------------------------------
 
 
+def _clamp_to_radius(x: jnp.ndarray, radius) -> jnp.ndarray:
+    """Scale x down to norm <= radius, with a gradient that's well-defined (the identity) at x=0.
+
+    ``jnp.linalg.norm``'s *gradient* is ``x/‖x‖`` — a genuine 0/0 exactly at the origin, even though
+    the value is perfectly smooth there (only the derivative is not). Both callers below (``_clamp_ball``
+    and ``PoincareHyperbolicEnvironment.wrap_point``) get evaluated *at* the origin unconditionally by
+    other code: ``weak_supervision.py``'s roadmap always keeps a node at exactly ``env.start``
+    (the origin by default), and ``roadmap_base`` evaluates ``env.slowness``/``env.wrap_point`` there
+    as part of every query point's loss. Even though that sub-term doesn't depend on the query point
+    and should contribute exactly 0 to its gradient, JAX still computes the *local* partial derivative
+    there as NaN, and ``NaN * 0 == NaN`` in IEEE 754 — worse, that NaN silently poisons *every* other
+    point's gradient too, not just this one, because ``roadmap_base`` batches all nodes' segment
+    samples through one call to ``env.slowness``/``env.wrap_point``, and a NaN local gradient at one
+    batch row survives being multiplied by a zero cotangent for unrelated rows during backprop
+    (confirmed by tracing: fixing only ``_clamp_ball`` left ``wrap_point``'s own unguarded norm doing
+    the same thing, and *every* one of 300 roadmap nodes' gradients came back NaN as a result, not just
+    the one sitting at the origin).
+
+    Substituting a nonzero dummy input for the norm computation only where ``x`` is exactly zero, then
+    selecting the true value (``x`` itself — both callers are the identity near the origin, since
+    ``radius`` is always > 0) via ``jnp.where`` for the forward pass, fixes this at the root: since
+    ``jnp.where``'s gradient only flows through the branch it selects, the origin's gradient comes out
+    to the identity — the actually-correct answer, since clamping never activates near the origin
+    anyway — instead of NaN.
+    """
+    is_zero = jnp.all(x == 0.0, axis=-1, keepdims=True)
+    safe_x = jnp.where(is_zero, jnp.ones_like(x), x)
+    norm = jnp.linalg.norm(safe_x, axis=-1, keepdims=True)
+    scaled = safe_x * jnp.minimum(1.0, radius / jnp.maximum(norm, 1e-12))
+    return jnp.where(is_zero, x, scaled)
+
+
 def _clamp_ball(x: jnp.ndarray) -> jnp.ndarray:
     """Pull a point strictly inside the unit ball (identity for ‖x‖ < 1 − 1e-6).
 
     Grid corners lie outside the ball (a Cartesian grid over [−R, R]^d reaches R√d), and those cells
     are masked for scoring but still *evaluated*. Clamping keeps artanh finite there instead of
-    letting NaNs propagate into an otherwise-valid figure.
+    letting NaNs propagate into an otherwise-valid figure. See ``_clamp_to_radius`` for why this has a
+    safe (non-NaN) gradient at the origin.
     """
-    norm = jnp.linalg.norm(x, axis=-1, keepdims=True)
-    return x * jnp.minimum(1.0, _MAX_NORM / jnp.maximum(norm, 1e-12))
+    return _clamp_to_radius(x, _MAX_NORM)
 
 
 def mobius_add(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
@@ -307,11 +339,28 @@ class PoincareHyperbolicEnvironment:
         return dist * u / jnp.maximum(norm, 1e-12), (r / jnp.sinh(r)) ** (self.dim - 1)
 
     def wrap_point(self, x: jnp.ndarray) -> jnp.ndarray:
-        """Pull back inside the ball; identity for points already interior."""
-        return _clamp_ball(x)
+        """Retract onto the workspace: clamp to ``trunc_radius``, not just the open unit ball.
+
+        Every optimizer-owned position that goes through this hook (srm's splat centres via
+        ``post_step``, RRT*/roadmap steering, hntfields' TD-loss stepped query) should live in the
+        *scored* workspace, not merely somewhere the hyperbolic distance formulas stay finite.
+        ``_clamp_ball``'s ``1 - 1e-6`` margin is a numerical safety net for internal math (``sdf`` at
+        grid corners, etc.); this is the actual geometric boundary — points past it are masked out of
+        every score and treated as a wall by ``sdf`` (see ``_rim_sdf``), so nothing should be left free
+        to drift out there. Measured effect on ``srm``: without this, an unmasked AdamW weight-decay
+        pull toward the origin was the only thing discouraging centres from wandering past
+        ``trunc_radius``, and removing that pull alone (see ``ntfields.py``'s ``decay_mask`` note) let
+        45% of splats end up outside the workspace, wasting capacity that this retraction reclaims.
+        See ``_clamp_to_radius`` for why this has a safe (non-NaN) gradient at the origin -- this
+        function is exactly as exposed to that bug as ``_clamp_ball`` is, since ``roadmap_base``
+        evaluates it directly at the roadmap's origin-sitting source node every step.
+        """
+        return _clamp_to_radius(x, self.trunc_radius)
 
     def wrap_point_np(self, x: np.ndarray) -> np.ndarray:
-        return _clamp_ball_np(np.asarray(x, dtype=float))
+        x = np.asarray(x, dtype=float)
+        norm = np.linalg.norm(x, axis=-1, keepdims=True)
+        return x * np.minimum(1.0, self.trunc_radius / np.maximum(norm, 1e-12))
 
     def displacement_np(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
         """Tangent vector at a pointing toward b, ‖·‖ = geodesic distance; broadcasts."""

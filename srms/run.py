@@ -21,6 +21,7 @@ from srms.environments import ENVIRONMENTS, sampling
 from srms.methods.backends import BACKENDS
 from srms.methods.strategies import eikonal, hntfields, ntfields, pntfields, weak_supervision
 from srms.viz import render, render_prediction
+from srms.viz_3d import render_3d
 
 STRATEGIES = {
     "eikonal": eikonal,
@@ -78,10 +79,10 @@ class Config:
 
     """
 
-    environment: Literal["torus", "sphere", "poincare_hyperbolic", "lorentz_hyperbolic"] = "torus"
+    environment: Literal["torus", "plane", "sphere", "poincare_hyperbolic", "lorentz_hyperbolic"] = "torus"
     dim: int = 2
     method: Literal["eikonal", "weak_supervision", "ntfields", "pntfields", "hntfields"] = "eikonal"
-    backend: Literal["srm", "mlp"] = "srm"
+    backend: Literal["srm", "mlp", "mlp_raw", "mlp_resnet"] = "srm"
     # scene
     start: tuple[float, ...] | None = None
     num_obstacles: int = 3
@@ -163,6 +164,17 @@ def _build_env(cfg: Config):
     if cfg.environment == "torus":
         start = cfg.start if cfg.start is not None else (-1.5,) * cfg.dim
         return ENVIRONMENTS["torus"](
+            start=start,
+            dim=cfg.dim,
+            num_obstacles=cfg.num_obstacles,
+            obstacle_radius=cfg.obstacle_radius,
+            slowness_max=cfg.slowness_max,
+            slow_width=cfg.slow_width,
+            seed=cfg.seed,
+        )
+    if cfg.environment == "plane":
+        start = cfg.start if cfg.start is not None else (-1.5,) * cfg.dim
+        return ENVIRONMENTS["plane"](
             start=start,
             dim=cfg.dim,
             num_obstacles=cfg.num_obstacles,
@@ -326,6 +338,7 @@ def main(cfg: Config) -> None:
         metrics["num_params"] = backend.num_params(splat)  # so srm/mlp are comparable at equal accuracy
         mlflow.log_metrics({f"final_{k}": v for k, v in metrics.items()})
         mlflow.log_artifact(f"{cfg.out_dir}/{out_name}")
+        render_3d(env, cfg, gt, prediction, inside, shape, thetas)  # no-op off torus/S² (see srms/viz_3d.py)
         print(f"saved {cfg.out_dir}/{out_name}  ({len(env.obstacles)} obstacles)")
         print(
             f"RMS={metrics['rms']:.4e}  max|err|={metrics['max_abs']:.4e}  "

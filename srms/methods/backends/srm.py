@@ -178,3 +178,19 @@ def adapt(params: SplatParams, opt_state, residual_fn, env, cfg, rng: np.random.
 def num_params(params: SplatParams) -> int:
     """Total trainable scalars — k·(p + d² + d). Reported so SRM/MLP can be compared at matched size."""
     return int(sum(np.prod(np.shape(x)) for x in jax.tree_util.tree_leaves(params)))
+
+
+def decay_mask(params: SplatParams) -> SplatParams:
+    """Weight-decay mask for ``optax.adamw``: decay ``(V, A)``, not ``B``.
+
+    AdamW's decoupled weight decay is a magnitude/complexity prior — sensible on the mixture weights
+    ``V`` and scale/rotation ``A``, but ``B`` is a *position*, and decaying it is a literal spatial
+    force pulling every splat's centre toward the chart origin every step, unrelated to anything the
+    loss is asking for. Harmless on the torus/sphere (origin is a geometrically arbitrary point there,
+    same distance-to-everywhere by symmetry) but actively wrong on a truncated environment like
+    ``poincare_hyperbolic``, where the origin is the one region that's already easiest to fit (least
+    curvature, typically the source) — measured there to visibly weaken the learned correction (see
+    ``ntfields.py``'s use of this mask).
+    """
+    V, A, B = params
+    return True, True, False

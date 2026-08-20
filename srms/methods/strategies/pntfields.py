@@ -124,7 +124,11 @@ def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
     params = backend.init_params(jax.random.PRNGKey(cfg.seed), env, cfg)
     rng = np.random.default_rng(cfg.seed)
 
-    optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(cfg.lr, weight_decay=0.1))
+    # mask=backend.decay_mask: decay lands on magnitude/shape params, not srm's splat centres — see
+    # srm.py's decay_mask docstring and ntfields.py's solve() for the measured effect.
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0), optax.adamw(cfg.lr, weight_decay=0.1, mask=backend.decay_mask)
+    )
     opt_state = optimizer.init(params)
 
     def loss_fn(p, colloc, slow, alpha):

@@ -114,7 +114,12 @@ def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
     ``tau_min=0`` an unfloored ``1/τ`` can blow up on its own, with no obstacle-band gating to damp
     collocation points that wander near it — hence the clip inside ``isotropic_loss``, matching
     ``weak_supervision.py`` and this repo's archived PINN scripts for the same loss family. The
-    optimizer is AdamW with weight decay 0.1, following the released implementation.
+    optimizer is AdamW with weight decay 0.1, following the released implementation, masked per
+    ``backend.decay_mask`` so decay lands on magnitude/shape parameters and not on srm's splat
+    centres — see ``srm.py``'s ``decay_mask`` docstring for the measured effect (on
+    ``poincare_hyperbolic``, unmasked decay on centres measurably weakened the learned correction by
+    pulling every splat toward the chart origin every step, an effect with no analogue in the
+    released MLP-based implementation this strategy otherwise follows).
     """
     if cfg.causal:
         print("[ntfields] paper-faithful: cfg.causal ignored (NTFields has no causal weighting)", flush=True)
@@ -123,7 +128,9 @@ def solve(env, cfg, backend, checkpoint=None, progress_fn=None):
     rng = np.random.default_rng(cfg.seed)
 
     # AdamW(weight_decay=0.1) matches the released implementation (NTFields models/model_3d.py).
-    optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(cfg.lr, weight_decay=0.1))
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0), optax.adamw(cfg.lr, weight_decay=0.1, mask=backend.decay_mask)
+    )
     opt_state = optimizer.init(params)
 
     def loss_fn(p, colloc, slow):
