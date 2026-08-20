@@ -18,7 +18,7 @@ import numpy as np
 
 from srms.environments.sphere import SphereEnvironment
 from srms.environments.torus import TorusEnvironment
-from visualize_3d import (
+from srms.visualization.utils_3d import (
     close_periodic,
     compute_field_contours,
     extract_path_grid,

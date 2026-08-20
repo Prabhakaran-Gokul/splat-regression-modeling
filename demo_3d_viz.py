@@ -16,7 +16,7 @@ from __future__ import annotations
 import numpy as np
 from pathlib import Path
 
-from visualize_3d import (
+from srms.visualization.utils_3d import (
     Sphere3DView,
     Torus3DView,
     plotly_sphere,

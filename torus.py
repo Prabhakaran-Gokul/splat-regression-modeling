@@ -29,7 +29,7 @@ import optax
 import tyro
 from tqdm import trange
 
-from visualize_3d import Torus3DView, plotly_torus, extract_path_torus
+from srms.visualization.utils_3d import Torus3DView, plotly_torus, extract_path_torus
 
 Obstacle = tuple[float, float, float]
 

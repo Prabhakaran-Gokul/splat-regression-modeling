@@ -42,10 +42,21 @@ def _draw_field(
         return handle, mesh1, mesh2
 
     mesh1, mesh2 = coords
+    # rasterized=True: imshow's branch above embeds `img` as a raster even in a vector backend
+    # (PDF/SVG), so it always looks like one smooth image; pcolormesh instead emits one flat-shaded
+    # vector polygon per grid cell, whose anti-aliased edges tile into a visible seam/moiré pattern
+    # once there are many small cells (a curvilinear chart's cells shrink sharply near the chart's
+    # own singular point, e.g. the Poincaré disk centre) — invisible in a raster PNG of the same
+    # figure, which is why this only shows up in the PDF. Rasterizing this element specifically (the
+    # axes/other artists stay vector) makes both backends draw the same way, and is also what keeps
+    # a fine render grid (see e.g. paper_figures/results_figure.py's _CHART_RENDER_RESOLUTION) from
+    # bloating the PDF into one vector polygon per cell.
     if edges is None:
-        handle = ax.pcolormesh(mesh1, mesh2, img, shading="auto", cmap=cmap, vmin=vmin, vmax=vmax)
+        handle = ax.pcolormesh(mesh1, mesh2, img, shading="auto", cmap=cmap, vmin=vmin, vmax=vmax, rasterized=True)
     else:
-        handle = ax.pcolormesh(edges[0], edges[1], img, shading="flat", cmap=cmap, vmin=vmin, vmax=vmax)
+        handle = ax.pcolormesh(
+            edges[0], edges[1], img, shading="flat", cmap=cmap, vmin=vmin, vmax=vmax, rasterized=True
+        )
     ax.add_patch(plt.Circle((0.0, 0.0), 1.0, fill=False, edgecolor="black", linewidth=1.0))
     ax.set_xlim(-1.05, 1.05)
     ax.set_ylim(-1.05, 1.05)
