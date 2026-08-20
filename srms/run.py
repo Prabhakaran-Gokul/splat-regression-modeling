@@ -21,6 +21,7 @@ from srms.environments import ENVIRONMENTS, sampling
 from srms.methods.backends import BACKENDS
 from srms.methods.strategies import eikonal, hntfields, ntfields, pntfields, weak_supervision
 from srms.viz import render, render_prediction
+from srms.viz_3d import render_3d
 
 STRATEGIES = {
     "eikonal": eikonal,
@@ -337,6 +338,7 @@ def main(cfg: Config) -> None:
         metrics["num_params"] = backend.num_params(splat)  # so srm/mlp are comparable at equal accuracy
         mlflow.log_metrics({f"final_{k}": v for k, v in metrics.items()})
         mlflow.log_artifact(f"{cfg.out_dir}/{out_name}")
+        render_3d(env, cfg, gt, prediction, inside, shape, thetas)  # no-op off torus/S² (see srms/viz_3d.py)
         print(f"saved {cfg.out_dir}/{out_name}  ({len(env.obstacles)} obstacles)")
         print(
             f"RMS={metrics['rms']:.4e}  max|err|={metrics['max_abs']:.4e}  "

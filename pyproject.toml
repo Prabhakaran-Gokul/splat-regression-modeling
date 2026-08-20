@@ -14,6 +14,8 @@ dependencies = [
     "tqdm>=4.66",
     "tyro>=0.8",
     "mlflow>=2.14",
+    "plotly>=6.9.0",
+    "kaleido>=0.2.1",
 ]
 
 [project.optional-dependencies]

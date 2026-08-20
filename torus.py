@@ -29,6 +29,8 @@ import optax
 import tyro
 from tqdm import trange
 
+from visualize_3d import Torus3DView, plotly_torus, extract_path_torus
+
 Obstacle = tuple[float, float, float]
 
 
@@ -794,6 +796,84 @@ def render(
     return {"rms": rms, "max_abs": float(np.nanmax(np.abs(error_img))), "rel_rms": rms / (np.nanstd(gt_img) + 1e-12)}
 
 
+def render_3d(
+    cfg: Config,
+    gt: np.ndarray,
+    prediction: np.ndarray,
+    inside: np.ndarray,
+    shape: tuple[int, int],
+    obstacles: tuple[Obstacle, ...],
+    suffix: str = "",
+) -> None:
+    """Generate publication-quality 3D visualizations on the torus surface.
+
+    Creates multi-angle static images (front/back/top/isometric), interactive HTML,
+    and visualizations with extracted paths.
+    """
+    gt_img = np.where(inside, np.nan, gt).reshape(shape)
+    pred_img = np.where(inside, np.nan, prediction).reshape(shape)
+    error_img = pred_img - gt_img
+
+    # Convert obstacles from (θ1, θ2, r) to list for visualization
+    obstacles_list = list(obstacles) if obstacles else []
+
+    # Extract a path on the prediction field
+    diag_goal = (cfg.start[0] + 1.5, cfg.start[1] + 1.5)  # diagonal from start
+    path = extract_path_torus(pred_img, start=cfg.start, goal=diag_goal, num_steps=60)
+
+    viewer = Torus3DView(elev=25, azim=45, resolution=shape[0])
+
+    # Multi-angle ground-truth
+    viewer.render_multiangle(
+        gt_img,
+        start=cfg.start,
+        obstacles=obstacles_list,
+        title=f"Ground-truth{suffix}",
+        out_dir=f"{cfg.out_dir}/3d_views",
+    )
+
+    # Multi-angle prediction with path
+    viewer.cmap = "plasma"
+    viewer.render_multiangle(
+        pred_img,
+        start=cfg.start,
+        path=path,
+        obstacles=obstacles_list,
+        title=f"Prediction{suffix}",
+        out_dir=f"{cfg.out_dir}/3d_views",
+    )
+
+    # Multi-angle error
+    viewer.cmap = "hot"
+    viewer.render_multiangle(
+        error_img,
+        start=cfg.start,
+        obstacles=obstacles_list,
+        title=f"Error{suffix}",
+        out_dir=f"{cfg.out_dir}/3d_views",
+    )
+
+    # Interactive Plotly versions
+    plotly_torus(
+        gt_img,
+        start=cfg.start,
+        obstacles=obstacles_list,
+        title=f"Ground-truth (Interactive){suffix}",
+        out_html=f"{cfg.out_dir}/3d_interactive_gt{suffix}.html",
+    )
+
+    plotly_torus(
+        pred_img,
+        start=cfg.start,
+        path=path,
+        obstacles=obstacles_list,
+        title=f"Prediction with Path (Interactive){suffix}",
+        out_html=f"{cfg.out_dir}/3d_interactive_pred{suffix}.html",
+    )
+
+    print(f"saved 3D visualizations to {cfg.out_dir}/3d_views/ and 3d_interactive_*.html")
+
+
 def main(cfg: Config) -> None:
     """Solve the torus Eikonal with obstacles self-supervised and score against periodic fast marching."""
     obstacles = torus_obstacles(cfg)
@@ -831,6 +911,10 @@ def main(cfg: Config) -> None:
     splat = solver(cfg, obstacles, checkpoint)
     prediction = predict_current(splat)
     metrics = render(cfg, gt, prediction, inside, shape)
+
+    # Generate 3D visualizations for publication
+    render_3d(cfg, gt, prediction, inside, shape, obstacles)
+
     with open(f"{cfg.out_dir}/splat.pkl", "wb") as f:  # save params + scene for the near-obstacle diagnostic
         pickle.dump({"splat": [np.asarray(a) for a in splat], "obstacles": obstacles, "cfg": dataclasses.asdict(cfg)}, f)
     print(f"saved {cfg.out_dir}/torus_obstacles.png  ({len(obstacles)} obstacles)")
